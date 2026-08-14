@@ -17,6 +17,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import stat
 import time
 import urllib.error
 import urllib.request
@@ -35,10 +36,46 @@ except ImportError:  # direct execution outside the repository root
     )
 
 DEFAULT_DB = Path("/opt/data/kanban.db")
+DEFAULT_ENV_FILE = Path("/opt/data/.env")
 DEFAULT_STATE = Path("/opt/data/cron/state/slack-dashboard-update.json")
 DEFAULT_CHANNEL = "C0BPXD9TBB7"
 DEFAULT_TS = "1786674259.552709"
 PROFILES = ("dev", "productdev", "research", "plan", "design")
+
+
+def _token_from_env_file(path: Path) -> str | None:
+    """Read only SLACK_BOT_TOKEN from a securely owned dotenv-style file."""
+    before = os.lstat(path)
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600):
+        raise PermissionError("unsafe env file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        after = os.fstat(fd)
+        if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or not stat.S_ISREG(after.st_mode) or after.st_uid != os.geteuid()
+                or stat.S_IMODE(after.st_mode) != 0o600):
+            raise PermissionError("unsafe env file")
+        contents = os.read(fd, 1024 * 1024 + 1)
+        if len(contents) > 1024 * 1024:
+            raise ValueError("env file too large")
+        text = contents.decode("utf-8")
+    finally:
+        os.close(fd)
+
+    for line in text.splitlines():
+        item = line.strip()
+        if item.startswith("export "):
+            item = item[7:].lstrip()
+        key, separator, value = item.partition("=")
+        if not separator or key.strip() != "SLACK_BOT_TOKEN":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value or None
+    return None
 
 
 def _pid_alive(pid: object) -> bool:
@@ -166,6 +203,7 @@ def main(argv: list[str] | None = None, *, sender: Callable = slack_sender,
          token_getter: Callable[[], str | None] = lambda: os.environ.get("SLACK_BOT_TOKEN")) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    p.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     p.add_argument("--state", type=Path, default=DEFAULT_STATE)
     p.add_argument("--lock", type=Path)
     p.add_argument("--channel", default=DEFAULT_CHANNEL)
@@ -188,7 +226,7 @@ def main(argv: list[str] | None = None, *, sender: Callable = slack_sender,
             current = fingerprint([{"dashboard": text}])  # type: ignore[list-item]
             if _old_fingerprint(args.state) == current:
                 return 0
-            token = token_getter()
+            token = token_getter() or _token_from_env_file(args.env_file)
             if not token:
                 raise RuntimeError("missing token")
             sender(args.channel, args.ts, text, token, args.timeout)

@@ -85,6 +85,49 @@ class WatcherTests(unittest.TestCase):
             kinds = {x["kind"] for x in watch.collect_exceptions(conn, 2000)}
         self.assertIn("run_card", kinds)
 
+    def test_dead_worker_pid_is_run_card_exception(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO tasks (id,title,status,created_at,current_run_id,last_heartbeat_at,worker_pid) VALUES ('T4','x','running',1,10,1900,123)")
+            conn.execute("INSERT INTO task_runs (id,task_id,status,started_at,last_heartbeat_at,worker_pid) VALUES (10,'T4','running',1,1900,123)")
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn, \
+                mock.patch("scripts.ops.kanban_exception_watch.os.kill", side_effect=ProcessLookupError):
+            kinds = {x["kind"] for x in watch.collect_exceptions(conn, 2000)}
+        self.assertIn("run_card", kinds)
+
+    def test_worker_birth_identity_mismatch_is_run_card_exception(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE task_runs ADD COLUMN worker_birth_identity TEXT")
+            conn.execute("INSERT INTO tasks (id,title,status,created_at,current_run_id,worker_pid) VALUES ('T5','x','running',1,11,123)")
+            conn.execute("INSERT INTO task_runs (id,task_id,status,started_at,worker_pid,worker_birth_identity) VALUES (11,'T5','running',1,123,'linux:boot:old')")
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn, \
+                mock.patch.object(watch, "_pid_alive", return_value=True), \
+                mock.patch.object(watch, "_process_birth_identity", return_value="linux:boot:new"):
+            kinds = {x["kind"] for x in watch.collect_exceptions(conn, 2000)}
+        self.assertIn("run_card", kinds)
+
+    def test_supported_start_tick_columns_detect_pid_reuse(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE task_runs ADD COLUMN process_start_ticks INTEGER")
+            conn.execute("ALTER TABLE task_runs ADD COLUMN worker_start_ticks INTEGER")
+            for run_id, column in ((12, "process_start_ticks"), (13, "worker_start_ticks")):
+                task_id = f"T{run_id}"
+                conn.execute(
+                    "INSERT INTO tasks (id,title,status,created_at,current_run_id,worker_pid) VALUES (?,?,?,?,?,?)",
+                    (task_id, "x", "running", 1, run_id, 123),
+                )
+                conn.execute(
+                    f"INSERT INTO task_runs (id,task_id,status,started_at,worker_pid,{column}) VALUES (?,?,?,?,?,?)",
+                    (run_id, task_id, "running", 1, 123, 111),
+                )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn, \
+                mock.patch.object(watch, "_pid_alive", return_value=True), \
+                mock.patch.object(watch, "_process_start_ticks", return_value=222):
+            exceptions = watch.collect_exceptions(conn, 2000)
+        self.assertEqual({"T12", "T13"}, {x["task"] for x in exceptions if x["kind"] == "run_card"})
+
     def test_duplicate_lock_is_silent(self):
         with watch.advisory_lock(self.lock):
             self.assertEqual((0, ""), self.run_main())

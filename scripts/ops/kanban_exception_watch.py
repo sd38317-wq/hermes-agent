@@ -49,6 +49,61 @@ def _read_db(path: Path, timeout: float = 2.0) -> sqlite3.Connection:
     return conn
 
 
+def _pid_alive(pid: object) -> bool:
+    try:
+        value = int(pid)  # type: ignore[arg-type]
+        if value <= 0:
+            return False
+        os.kill(value, 0)
+        return True
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+
+
+def _process_start_ticks(pid: object) -> int | None:
+    try:
+        value = int(pid)  # type: ignore[arg-type]
+        stat = Path(f"/proc/{value}/stat").read_text(encoding="ascii")
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (TypeError, ValueError, OSError, IndexError):
+        return None
+
+
+def _process_birth_identity(pid: object) -> str | None:
+    """Return the Linux boot/process-start identity used by current schemas."""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        start_ticks = _process_start_ticks(pid)
+        return f"linux:{boot_id}:{start_ticks}" if start_ticks is not None else None
+    except OSError:
+        return None
+
+
+def _worker_matches(row: sqlite3.Row, columns: set[str]) -> bool:
+    """Check liveness and any creation identity available in this schema."""
+    if "worker_pid" not in columns or row["worker_pid"] is None:
+        return True
+    pid = row["worker_pid"]
+    if not _pid_alive(pid):
+        return False
+    if "worker_birth_identity" in columns and row["worker_birth_identity"] is not None:
+        return _process_birth_identity(pid) == str(row["worker_birth_identity"])
+    expected_col = next(
+        (name for name in ("process_start_ticks", "worker_start_ticks")
+         if name in columns and row[name] is not None),
+        None,
+    )
+    if expected_col is None:
+        return True
+    actual = _process_start_ticks(pid)
+    try:
+        return actual is not None and actual == int(row[expected_col])
+    except (TypeError, ValueError):
+        return False
+
+
 def collect_exceptions(conn: sqlite3.Connection, now: int | None = None) -> list[dict[str, str]]:
     """Return sorted, content-free canonical exception records."""
     now = int(time.time()) if now is None else now
@@ -82,6 +137,8 @@ def collect_exceptions(conn: sqlite3.Connection, now: int | None = None) -> list
                 found.add(("run_card", str(run["task_id"])))
             elif "worker_pid" in tc and "worker_pid" in rc and task["worker_pid"] is not None \
                     and run["worker_pid"] is not None and int(task["worker_pid"]) != int(run["worker_pid"]):
+                found.add(("run_card", str(run["task_id"])))
+            if not _worker_matches(run, rc) or (task is not None and not _worker_matches(task, tc)):
                 found.add(("run_card", str(run["task_id"])))
             hb = run["last_heartbeat_at"] if "last_heartbeat_at" in rc else None
             if hb is not None and now - int(hb) > 3600:
