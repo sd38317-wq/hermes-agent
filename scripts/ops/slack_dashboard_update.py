@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import json
 import os
 import sqlite3
 import stat
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -27,20 +29,17 @@ from typing import Callable
 try:
     from scripts.ops.kanban_exception_watch import (
         _columns, _read_db, _old_fingerprint, advisory_lock, fingerprint,
-        save_state_atomic,
     )
 except ImportError:  # direct execution outside the repository root
     from kanban_exception_watch import (  # type: ignore
         _columns, _read_db, _old_fingerprint, advisory_lock, fingerprint,
-        save_state_atomic,
     )
 
 DEFAULT_DB = Path("/opt/data/kanban.db")
 DEFAULT_ENV_FILE = Path("/opt/data/.env")
 DEFAULT_STATE = Path("/opt/data/cron/state/slack-dashboard-update.json")
 DEFAULT_CHANNEL = "C0BPXD9TBB7"
-DEFAULT_TS = "1786674259.552709"
-PROFILES = ("dev", "productdev", "research", "plan", "design")
+DEFAULT_TS = "1786717991.405699"
 
 
 def _token_from_env_file(path: Path) -> str | None:
@@ -128,66 +127,60 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
     if {"task_id", "status"} <= rc:
         for row in conn.execute("SELECT * FROM task_runs WHERE status='running' ORDER BY id"):
             runs.setdefault(str(row["task_id"]), []).append(row)
-    counts = {p: {"working": 0, "waiting": 0, "blocked": 0} for p in PROFILES}
-    done = total = 0
-    seen_tasks: set[str] = set()
+    focus: dict[str, str] | None = None
+    focus_key: tuple[int, int, str] | None = None
     for task in tasks:
         task_id = str(task["id"])
-        seen_tasks.add(task_id)
         active = runs.get(task_id, [])
-        profile = str(task["assignee"] or "") if "assignee" in tc else ""
-        if profile not in counts and active and "profile" in rc:
-            profile = str(active[0]["profile"] or "")
-        if profile not in counts:
-            continue
         status = str(task["status"] or "")
-        if status in {"done", "cancelled"}:
-            done += status == "done"
-            total += 1
-            continue
-        total += 1
-        if status in {"blocked", "triage"}:
-            bucket = "blocked"
-        elif status == "running":
+        valid_running = False
+        if status == "running":
             run = active[0] if len(active) == 1 else None
-            valid = run is not None
-            if valid and "current_run_id" in tc and task["current_run_id"] is not None and "id" in rc:
-                valid = int(task["current_run_id"]) == int(run["id"])
-            if valid and "last_heartbeat_at" in rc and run["last_heartbeat_at"] is not None:
-                valid = now - int(run["last_heartbeat_at"]) <= 3600
+            valid_running = run is not None
+            if valid_running and "current_run_id" in tc and task["current_run_id"] is not None and "id" in rc:
+                valid_running = int(task["current_run_id"]) == int(run["id"])
+            if valid_running and "last_heartbeat_at" in rc and run["last_heartbeat_at"] is not None:
+                valid_running = now - int(run["last_heartbeat_at"]) <= 3600
             pid_row, pid_cols = (run, rc) if run is not None and "worker_pid" in rc else (task, tc)
-            if valid and "worker_pid" in pid_cols and pid_row["worker_pid"] is not None:
-                valid = _pid_alive(pid_row["worker_pid"]) and _creation_matches(pid_row, pid_cols)
-            bucket = "working" if valid else "blocked"
-        elif active:
-            bucket = "blocked"
-        else:
-            bucket = "waiting"
-        counts[profile][bucket] += 1
-    for task_id, orphan_runs in runs.items():
-        if task_id in seen_tasks:
-            continue
-        for run in orphan_runs:
-            profile = str(run["profile"] or "") if "profile" in rc else ""
-            if profile in counts:
-                counts[profile]["blocked"] += 1
-                total += 1
-    progress = 100 if total == 0 else (done * 100) // total
-    return {"profiles": counts, "done": done, "total": total, "progress": progress}
+            if valid_running and "worker_pid" in pid_cols and pid_row["worker_pid"] is not None:
+                valid_running = _pid_alive(pid_row["worker_pid"]) and _creation_matches(pid_row, pid_cols)
+        rank = 99
+        label = ""
+        if valid_running:
+            rank, label = 0, "진행 중"
+        elif (status == "blocked" and "block_kind" in tc
+                and str(task["block_kind"] or "") == "needs_input"):
+            rank, label = 1, "답변 대기"
+        elif status == "ready":
+            rank, label = 2, "준비됨"
+        try:
+            priority = int(task["priority"] or 0) if "priority" in tc else 0
+        except (TypeError, ValueError):
+            priority = 0
+        candidate_key = (rank, -priority, task_id)
+        if rank < 99 and (focus_key is None or candidate_key < focus_key):
+            focus_key = candidate_key
+            focus = {"id": task_id,
+                     "title": str(task["title"] or task_id) if "title" in tc else task_id,
+                     "label": label}
+    return {"focus": focus, "total": len(tasks)}
 
 
 def render(data: dict[str, object]) -> str:
-    labels = {"working": "작업", "waiting": "대기", "blocked": "막힘"}
-    profiles = data["profiles"]
-    lines = [f"칸반 현황 · 전체 진행 {data['done']}/{data['total']} ({data['progress']}%)"]
-    for profile in PROFILES:
-        row = profiles[profile]  # type: ignore[index]
-        lines.append(f"• {profile}: " + " · ".join(f"{labels[k]} {row[k]}" for k in labels))
-    return "\n".join(lines)
+    focus = data.get("focus")
+    if not isinstance(focus, dict):
+        return "현재 진행 중인 작업이 없어요."
+    return f"현재 집중 · {focus['label']}\n{focus['title']} ({focus['id']})"
 
 
-def slack_sender(channel: str, ts: str, text: str, token: str, timeout: float) -> None:
-    payload = json.dumps({"channel": channel, "ts": ts, "text": text}, separators=(",", ":")).encode()
+def render_blocks(text: str) -> list[dict[str, object]]:
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+
+def slack_sender(channel: str, ts: str, text: str, token: str, timeout: float, *,
+                 blocks: list[dict[str, object]] | None = None) -> None:
+    payload = json.dumps({"channel": channel, "ts": ts, "text": text,
+                          "blocks": blocks or render_blocks(text)}, separators=(",", ":")).encode()
     req = urllib.request.Request("https://slack.com/api/chat.update", data=payload,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}, method="POST")
     try:
@@ -199,7 +192,86 @@ def slack_sender(channel: str, ts: str, text: str, token: str, timeout: float) -
         raise RuntimeError("Slack update rejected")
 
 
+def _slack_call(method: str, payload: dict[str, object], token: str, timeout: float) -> dict[str, object]:
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    req = urllib.request.Request(f"https://slack.com/api/{method}", data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read(65536))
+    except (OSError, ValueError, urllib.error.URLError):
+        raise RuntimeError("Slack request failed") from None
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError("Slack request rejected")
+    return result
+
+
+def slack_message_exists(channel: str, ts: str, token: str, timeout: float) -> bool:
+    result = _slack_call("conversations.history", {
+        "channel": channel, "oldest": ts, "latest": ts, "inclusive": True, "limit": 1,
+    }, token, timeout)
+    messages = result.get("messages")
+    return isinstance(messages, list) and any(
+        isinstance(message, dict) and str(message.get("ts")) == ts for message in messages)
+
+
+def slack_poster(channel: str, text: str, token: str, timeout: float, *,
+                 blocks: list[dict[str, object]] | None = None) -> str:
+    result = _slack_call("chat.postMessage", {"channel": channel, "text": text,
+                         "blocks": blocks or render_blocks(text)}, token, timeout)
+    ts = result.get("ts")
+    if not isinstance(ts, str) or not ts:
+        raise RuntimeError("Slack post omitted timestamp")
+    return ts
+
+
+def _load_state(path: Path) -> dict[str, str]:
+    _old_fingerprint(path)  # preserves the shared symlink rejection contract
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return {key: str(value[key]) for key in ("fingerprint", "ts")
+                if isinstance(value, dict) and isinstance(value.get(key), str)}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(path: Path, current: str, ts: str) -> None:
+    _old_fingerprint(path)  # rejects a symlink target
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise ValueError("unsafe state directory")
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"fingerprint": current, "ts": ts}, fh, sort_keys=True, separators=(",", ":"))
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, path)
+        dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
+def _send_with_optional_blocks(call: Callable, args: tuple[object, ...],
+                               blocks: list[dict[str, object]]):
+    """Pass blocks when supported while preserving legacy injected callables."""
+    try:
+        inspect.signature(call).bind(*args, blocks=blocks)
+    except (TypeError, ValueError):
+        return call(*args)
+    return call(*args, blocks=blocks)
+
+
 def main(argv: list[str] | None = None, *, sender: Callable = slack_sender,
+         verifier: Callable | None = None, poster: Callable | None = None,
          token_getter: Callable[[], str | None] = lambda: os.environ.get("SLACK_BOT_TOKEN")) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -223,14 +295,25 @@ def main(argv: list[str] | None = None, *, sender: Callable = slack_sender,
             with contextlib.closing(_read_db(args.db, args.timeout)) as conn:
                 data = compute_dashboard(conn, args.now)
             text = render(data)
-            current = fingerprint([{"dashboard": text}])  # type: ignore[list-item]
-            if _old_fingerprint(args.state) == current:
-                return 0
+            blocks = render_blocks(text)
+            current = fingerprint([{"dashboard": text, "blocks": blocks}])  # type: ignore[list-item]
             token = token_getter() or _token_from_env_file(args.env_file)
             if not token:
                 raise RuntimeError("missing token")
-            sender(args.channel, args.ts, text, token, args.timeout)
-            save_state_atomic(args.state, current)
+            state = _load_state(args.state)
+            ts = state.get("ts", args.ts)
+            check = verifier or (slack_message_exists if sender is slack_sender else lambda *unused: True)
+            post = poster or slack_poster
+            if not check(args.channel, ts, token, args.timeout):
+                ts = _send_with_optional_blocks(
+                    post, (args.channel, text, token, args.timeout), blocks)
+                _save_state(args.state, current, ts)
+                return 0
+            if state.get("fingerprint") == current:
+                return 0
+            _send_with_optional_blocks(
+                sender, (args.channel, ts, text, token, args.timeout), blocks)
+            _save_state(args.state, current, ts)
             return 0
     except BlockingIOError:
         return 0
