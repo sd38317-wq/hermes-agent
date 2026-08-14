@@ -295,8 +295,9 @@ def test_explicit_per_profile_cap_raises_the_live_run_budget(kb, procs):
     assert res.skipped_profile_busy == []
 
 
-def test_dead_worker_pid_does_not_wedge_the_profile(kb):
-    """An open run whose worker PID is dead must not block the next card."""
+def test_dead_worker_pid_does_not_wedge_the_profile(kb, monkeypatch):
+    """An open run whose worker PID is dead must not wedge the profile."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     with kb.connect_closing() as conn:
         busy = kb.create_task(conn, title="zombie run", assignee="alpha")
         nxt = kb.create_task(conn, title="queued", assignee="alpha")
@@ -305,8 +306,18 @@ def test_dead_worker_pid_does_not_wedge_the_profile(kb):
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(conn, spawn_fn=_spawn_stub(None))
 
-    assert nxt in [s[0] for s in res.spawned]
-    assert res.skipped_profile_busy == []
+    # The dead run is reclaimed rather than held, so the profile keeps
+    # dispatching: exactly one card starts, and the slot is handed out once.
+    # WHICH card wins is ordinary scheduling order (the reclaimed card was
+    # created first at the same priority), not part of this contract — the
+    # wedge is.
+    spawned = [task_id for task_id, _, _ in res.spawned]
+    assert len(spawned) == 1
+    assert spawned[0] in (busy, nxt)
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE ended_at IS NULL"
+        ).fetchone()[0] == 1
 
 
 def test_stale_heartbeat_does_not_wedge_the_profile(kb, procs):
@@ -1573,7 +1584,11 @@ def test_concurrent_dispatch_never_double_claims_a_profile(kb, procs):
 
 
 def test_concurrent_dispatch_across_boards_claims_profile_at_most_once(kb, procs):
-    """Board-scoped dispatch locks must not permit a cross-board profile race."""
+    """Board-scoped locks cannot permit a cross-board profile race.
+
+    Regression shape: dev run 110 (t_338c2e27) and run 111 (t_83208337)
+    were claimed at the same instant and both worker trees stayed alive.
+    """
     live = _spawn_live_session(procs)
     kb.create_board(slug="other", name="Other")
     task_ids: dict[str, str] = {}
@@ -1613,7 +1628,7 @@ def test_concurrent_dispatch_across_boards_claims_profile_at_most_once(kb, procs
 
     assert not any(thread.is_alive() for thread in threads)
     assert errors == []
-    assert len(spawned) <= 1
+    assert len(spawned) == 1
     running = 0
     open_runs = 0
     for board in task_ids:
@@ -1625,8 +1640,37 @@ def test_concurrent_dispatch_across_boards_claims_profile_at_most_once(kb, procs
             open_runs += conn.execute(
                 "SELECT COUNT(*) FROM task_runs WHERE ended_at IS NULL"
             ).fetchone()[0]
-    assert running <= 1
-    assert open_runs <= 1
+    assert running == 1
+    assert open_runs == 1
+
+
+def test_dispatch_fails_closed_when_board_lock_path_cannot_be_resolved(
+    kb, monkeypatch,
+):
+    """Lock-path failure must never reopen the unguarded claim race."""
+    spawned: list[str] = []
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="must stay ready", assignee="alpha")
+
+        real_path = kb.kanban_db_path
+        path_calls = 0
+
+        def broken_path(*args, **kwargs):
+            nonlocal path_calls
+            path_calls += 1
+            if path_calls == 1:
+                raise OSError("board path unavailable")
+            return real_path(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "kanban_db_path", broken_path)
+        with pytest.raises(RuntimeError, match="dispatch lock path"):
+            kb.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace, **kwargs: spawned.append(task.id),
+            )
+
+        assert spawned == []
+        assert kb.get_task(conn, task_id).status == "ready"
 
 
 def test_assignee_introduced_while_dispatch_waits_cannot_race_cross_board(
