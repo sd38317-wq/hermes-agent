@@ -100,10 +100,16 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     claimed = kb.claim_task(conn, child_id)
     assert claimed is not None and claimed.status == "running"
     kb._set_worker_pid(conn, child_id, 424242)
+    worker_birth_identity = "birth:424242:current-run"
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET worker_birth_identity = ? WHERE id = ?",
+            (worker_birth_identity, claimed.current_run_id),
+        )
 
     kills: list[tuple] = []
 
-    def fake_terminate(pid, claim_lock, **kwargs):
+    def fake_terminate(pid, claim_lock, birth_identity, **kwargs):
         # The audit trail must already be durable when the kill fires:
         # standalone calls commit before terminating.
         side = kb.connect(tmp_path / "kanban.db")
@@ -112,7 +118,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         finally:
             side.close()
         assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock))
+        kills.append((pid, claim_lock, birth_identity))
         return {"terminated": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
@@ -122,7 +128,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         conn, parent_id, author="operator",
     )
 
-    assert kills and kills[0][0] == 424242
+    assert kills == [(424242, claimed.claim_lock, worker_birth_identity)]
     assert result["terminations"] == kills
     child = kb.get_task(conn, child_id)
     assert child is not None

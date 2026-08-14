@@ -370,6 +370,8 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    owner_task_id: str = ""                    # Durable kanban task ownership
+    owner_run_id: Optional[int] = None          # Durable exact kanban run ownership
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -996,6 +998,8 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            owner_task_id=(os.environ.get("HERMES_KANBAN_TASK") or "").strip(),
+            owner_run_id=self._kanban_owner_run_id(),
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -1226,6 +1230,8 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            owner_task_id=(os.environ.get("HERMES_KANBAN_TASK") or "").strip(),
+            owner_run_id=self._kanban_owner_run_id(),
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -2440,6 +2446,53 @@ class ProcessRegistry:
                 killed += 1
         return killed
 
+    @staticmethod
+    def _kanban_owner_run_id() -> Optional[int]:
+        raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+        try:
+            return int(raw) if raw else None
+        except ValueError:
+            return None
+
+    def reap_owned_kanban_run(self, task_id: str, run_id: Optional[int]) -> int:
+        """Reap exact processes durably owned by one kanban run.
+
+        Ownership comes only from spawn-time task/run metadata. Host PID birth
+        identity is revalidated immediately before entering the registry's
+        platform-aware kill path; missing or mismatched identity fails closed.
+        Sandbox sessions are terminated through their environment backend. No
+        ancestry, command-line, process-group, browser-profile, or session-name
+        inference is used.
+        """
+        if run_id is None:
+            return 0
+        with self._lock:
+            targets = [
+                session for session in self._running.values()
+                if not session.exited
+                and session.owner_task_id == task_id
+                and session.owner_run_id == int(run_id)
+            ]
+        reaped = 0
+        for session in targets:
+            if session.pid_scope == "host":
+                if (
+                    not session.pid
+                    or session.host_start_time is None
+                    or not self._host_pid_is_ours(
+                        session.pid, session.host_start_time
+                    )
+                ):
+                    continue
+            result = self.kill_process(
+                session.id,
+                source="kanban_terminal_transition",
+                consume_output=True,
+            )
+            if result.get("status") in {"killed", "already_exited"}:
+                reaped += 1
+        return reaped
+
     # ----- Cleanup / Pruning -----
 
     def _prune_if_needed(self):
@@ -2510,6 +2563,8 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "owner_task_id": s.owner_task_id,
+                            "owner_run_id": s.owner_run_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2599,6 +2654,8 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                owner_task_id=entry.get("owner_task_id", ""),
+                owner_run_id=entry.get("owner_run_id"),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,

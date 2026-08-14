@@ -107,6 +107,135 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
     ]
 
 
+class TestReapOwnedKanbanRun:
+    """Terminal transitions use the registry's full backend-aware kill path."""
+
+    @staticmethod
+    def _owned(session, *, task_id="kanban-task", run_id=17):
+        session.owner_task_id = task_id
+        session.owner_run_id = run_id
+        return session
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree integration")
+    @pytest.mark.live_system_guard_bypass
+    def test_reaps_owned_host_process_tree(self, registry):
+        parent_src = (
+            "import subprocess,sys,time;"
+            "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)']);"
+            "print(child.pid,flush=True);time.sleep(120)"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", parent_src],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        child_pid = int(parent.stdout.readline().strip())
+        session = self._owned(_make_session(sid="proc_owned_tree"))
+        session.pid = parent.pid
+        session.process = parent
+        session.host_start_time = ProcessRegistry._safe_host_start_time(parent.pid)
+        registry._running[session.id] = session
+        try:
+            assert registry.reap_owned_kanban_run("kanban-task", 17) == 1
+            import psutil
+
+            def child_is_dead():
+                try:
+                    return not ProcessRegistry._proc_alive(psutil.Process(child_pid))
+                except psutil.Error:
+                    return True
+
+            assert _wait_until(
+                child_is_dead, timeout=10,
+            ), "owned child process survived its wrapper"
+        finally:
+            for pid in (child_pid, parent.pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            parent.wait(timeout=10)
+
+    def test_stops_owned_systemd_scope(self, registry, monkeypatch):
+        from tools import process_registry as pr
+
+        session = self._owned(_make_session(sid="proc_owned_scope"))
+        session.pid = 4242
+        session.detached = True
+        session.host_start_time = 99
+        session.systemd_unit = "hermes-worker-owned.scope"
+        registry._running[session.id] = session
+        stopped = []
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_host_pid_is_ours",
+            classmethod(lambda cls, pid, birth: True),
+        )
+        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, birth: None)
+        monkeypatch.setattr(pr, "_stop_systemd_unit", lambda unit: stopped.append(unit) or True)
+
+        assert registry.reap_owned_kanban_run("kanban-task", 17) == 1
+        assert stopped == ["hermes-worker-owned.scope"]
+
+    def test_uses_windows_tree_kill_semantics(self, registry, monkeypatch):
+        from tools import process_registry as pr
+
+        session = self._owned(_make_session(sid="proc_owned_windows"))
+        session.pid = 4242
+        session.detached = True
+        session.host_start_time = 99
+        registry._running[session.id] = session
+        calls = []
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_host_pid_is_ours",
+            classmethod(lambda cls, pid, birth: True),
+        )
+        monkeypatch.setattr(
+            pr.subprocess,
+            "run",
+            lambda argv, **kwargs: calls.append((argv, kwargs)) or MagicMock(returncode=0),
+        )
+
+        assert registry.reap_owned_kanban_run("kanban-task", 17) == 1
+        assert calls[0][0] == ["taskkill", "/PID", "4242", "/T", "/F"]
+
+    def test_kills_owned_sandbox_and_preserves_non_exact_and_special_sessions(
+        self, registry,
+    ):
+        backend = MagicMock()
+        backend.execute.return_value = {"returncode": 0, "output": ""}
+        owned = self._owned(_make_session(sid="proc_owned_sandbox"))
+        owned.pid = 7331
+        owned.pid_scope = "sandbox"
+        owned.env_ref = backend
+
+        sessions = [owned]
+        for sid, owner_task, owner_run in (
+            ("proc_wrong_task", "other-task", 17),
+            ("proc_wrong_run", "kanban-task", 18),
+            ("browser_session", "", None),
+            ("auth_session", "", None),
+        ):
+            session = _make_session(sid=sid)
+            session.pid = 8000 + len(sessions)
+            session.pid_scope = "sandbox"
+            session.env_ref = MagicMock()
+            session.owner_task_id = owner_task
+            session.owner_run_id = owner_run
+            sessions.append(session)
+        registry._running.update({session.id: session for session in sessions})
+
+        assert registry.reap_owned_kanban_run("kanban-task", 17) == 1
+        backend.execute.assert_called_once_with("kill 7331 2>/dev/null", timeout=5)
+        assert owned.id in registry._finished
+        for session in sessions[1:]:
+            assert session.id in registry._running
+            session.env_ref.execute.assert_not_called()
+
+
 def test_kill_all_backward_compat_and_exclude_ids(registry):
     """kill_all keeps its historical default behavior (kill everything for
     the task, consume_output=False, source='kill_all') and honors the new

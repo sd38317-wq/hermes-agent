@@ -27,6 +27,7 @@ Plus concurrent-claim races: parallel ``claim_task`` and parallel
 from __future__ import annotations
 
 import os
+import json
 import signal
 import subprocess
 import sys
@@ -813,6 +814,59 @@ def test_request_review_reaps_committed_run_snapshot_not_successor(
     assert successor_run != implementation.current_run_id
 
 
+@pytest.mark.parametrize("transition", ["archive", "schedule"])
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_archive_and_schedule_reap_exact_running_worker_only(
+    kb, procs, transition,
+):
+    worker = _spawn_live_session(procs)
+    unrelated = _spawn_live_session(procs)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title=f"{transition} running", assignee="alpha")
+        claimed = _make_running(kb, conn, tid, pid=worker.pid)
+        if transition == "archive":
+            assert kb.archive_task(conn, tid)
+        else:
+            assert kb.schedule_task(
+                conn, tid, expected_run_id=claimed.current_run_id,
+            )
+
+    assert _wait_gone(worker.pid), f"worker survived {transition}"
+    assert unrelated.poll() is None
+
+
+@pytest.mark.parametrize("transition", ["archive", "schedule"])
+def test_archive_and_schedule_reap_committed_snapshot_not_successor(
+    kb, monkeypatch, transition,
+):
+    observed: dict[str, object] = {}
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title=f"{transition} race", assignee="alpha")
+        original = _make_running(kb, conn, tid, pid=111111)
+
+        def claim_successor(task_id, snapshot):
+            assert conn.in_transaction is False
+            observed.update(snapshot)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+            successor = kb.claim_task(conn, task_id)
+            assert successor is not None
+            kb._set_worker_pid(conn, task_id, 222222)
+
+        monkeypatch.setattr(kb, "_reap_finished_run_worker", claim_successor)
+        if transition == "archive":
+            assert kb.archive_task(conn, tid)
+        else:
+            assert kb.schedule_task(
+                conn, tid, expected_run_id=original.current_run_id,
+            )
+        successor_run = kb.get_task(conn, tid).current_run_id
+
+    assert observed["run_id"] == original.current_run_id
+    assert observed["worker_pid"] == 111111
+    assert successor_run != original.current_run_id
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
 def test_unblock_reaps_a_defensively_reclaimed_dangling_run(kb, procs):
     worker = _spawn_live_session(procs)
@@ -960,6 +1014,52 @@ def test_self_transition_reaps_descendants_but_never_itself(kb, procs):
     assert detached.poll() is None, "detached session was killed"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX detached-process integration")
+def test_terminal_transition_reaps_owned_background_process_only(
+    kb, procs, monkeypatch, tmp_path,
+):
+    """A real terminal(background=True) child is run-owned, not ancestry-owned."""
+    browser = _spawn_live_session(procs)
+    auth = _spawn_live_session(procs)
+    naver = _spawn_live_session(procs)
+    naver_profile = tmp_path / "naver-profile"
+    naver_profile.mkdir()
+    cookie_db = naver_profile / "Cookies"
+    cookie_db.write_bytes(b"naver-auth-data-must-survive")
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="managed background", assignee="alpha")
+        claimed = _make_running(kb, conn, tid, pid=os.getpid())
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+        from tools.terminal_tool import terminal_tool
+        from tools.process_registry import process_registry
+
+        result = json.loads(terminal_tool(
+            command=f"exec {sys.executable} -c 'import time; time.sleep(120)'",
+            background=True,
+            task_id=tid,
+            workdir=str(tmp_path),
+            force=True,
+        ))
+        assert result["exit_code"] == 0
+        managed_pid = int(result["pid"])
+        managed = process_registry.get(result["session_id"])
+        assert managed is not None and managed.process is not None
+        procs.append(managed.process)
+
+        assert kb.complete_task(
+            conn, tid, result="done", expected_run_id=claimed.current_run_id,
+        )
+
+    assert _wait_gone(managed_pid), "run-owned background terminal child leaked"
+    assert browser.poll() is None
+    assert auth.poll() is None
+    assert naver.poll() is None
+    assert cookie_db.read_bytes() == b"naver-auth-data-must-survive"
+
+
 def test_reap_ignores_a_foreign_host_claim(kb):
     """A pid owned by another host is never signalled locally."""
     killed: list[tuple[int, int]] = []
@@ -985,6 +1085,56 @@ def test_reap_fails_closed_when_worker_birth_identity_changed(kb, monkeypatch):
 
     assert killed == []
     assert info["skipped"] == "identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("path", "recorded_identity"),
+    [
+        ("ttl", None),
+        ("manual", "old-birth"),
+        ("max_runtime", None),
+        ("stale_running", "old-birth"),
+    ],
+)
+def test_reclaim_and_timeout_paths_fail_closed_on_worker_identity(
+    kb, monkeypatch, path, recorded_identity,
+):
+    """No reclaim/timeout path may signal a PID without its exact birth."""
+    signalled: list[tuple[int, int]] = []
+    now = int(time.time())
+    monkeypatch.setattr(kb, "_process_birth_identity", lambda _pid: "new-birth")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title=f"identity-safe {path}", assignee="alpha",
+            max_runtime_seconds=1 if path == "max_runtime" else None,
+        )
+        _make_running(kb, conn, tid, pid=424242, heartbeat_age=7200)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_birth_identity = ?, started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (recorded_identity, now - 7200, tid),
+            )
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, started_at = ? WHERE id = ?",
+                (now - 1, now - 7200, tid),
+            )
+
+        signal_fn = lambda pid, sig: signalled.append((pid, sig))
+        if path == "ttl":
+            assert kb.release_stale_claims(conn, signal_fn=signal_fn) == 1
+        elif path == "manual":
+            assert kb.reclaim_task(conn, tid, signal_fn=signal_fn)
+        elif path == "max_runtime":
+            assert kb.enforce_max_runtime(conn, signal_fn=signal_fn) == [tid]
+        else:
+            assert kb.detect_stale_running(
+                conn, stale_timeout_seconds=1, signal_fn=signal_fn,
+            ) == [tid]
+
+    assert signalled == []
 
 
 def test_worker_pid_registration_is_cas_bound_to_exact_run(kb, monkeypatch):

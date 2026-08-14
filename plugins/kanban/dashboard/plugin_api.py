@@ -1098,7 +1098,9 @@ def _parents_blocking_ready(
 def _invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     parent_id: str,
-    terminations: list[tuple[Optional[int], Optional[str]]],
+    terminations: list[
+        tuple[Optional[int], Optional[str], Optional[str]]
+    ],
 ) -> None:
     """Delegate to the domain-layer implementation in :mod:`kanban_db`.
 
@@ -1130,13 +1132,18 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[
+        tuple[Optional[int], Optional[str], Optional[str]]
+    ] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock "
-            "FROM tasks WHERE id = ?",
+            "SELECT t.status, t.current_run_id, t.worker_pid, t.claim_lock, "
+            "       r.worker_birth_identity "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
@@ -1197,7 +1204,11 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            terminations.append((
+                prev["worker_pid"],
+                prev["claim_lock"],
+                prev["worker_birth_identity"],
+            ))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
@@ -1219,8 +1230,10 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+    for pid, claim_lock, worker_birth_identity in terminations:
+        kanban_db._terminate_reclaimed_worker(
+            pid, claim_lock, worker_birth_identity,
+        )
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)

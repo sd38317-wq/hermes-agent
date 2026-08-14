@@ -27,8 +27,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -40,7 +40,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -308,6 +313,41 @@ def test_reopening_parent_demotes_ready_child(client):
         f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
     assert child_after_reopen["status"] == "todo"
+
+
+def test_direct_running_to_ready_cleans_exact_worker_identity_after_commit(
+    kanban_home, monkeypatch,
+):
+    mod = _load_plugin_module()
+    worker_birth_identity = "birth:424242:current-run"
+    observed: list[tuple[int, str, str]] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="running", assignee="builder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 424242)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_birth_identity = ? WHERE id = ?",
+                (worker_birth_identity, claimed.current_run_id),
+            )
+
+        def fake_terminate(pid, claim_lock, birth_identity):
+            with kb.connect() as side:
+                task = kb.get_task(side, task_id)
+                run = kb.latest_run(side, task_id)
+            assert task is not None and task.status == "ready"
+            assert run is not None and run.outcome == "reclaimed"
+            observed.append((pid, claim_lock, birth_identity))
+            return {"terminated": True}
+
+        monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+        assert mod._set_status_direct(conn, task_id, "ready")
+
+    assert observed == [
+        (424242, claimed.claim_lock, worker_birth_identity),
+    ]
 
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
@@ -940,5 +980,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

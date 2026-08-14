@@ -1229,6 +1229,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        monkeypatch.setattr(
+            _kb, "_process_birth_identity", lambda _pid: "test-birth",
+        )
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -1236,8 +1239,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
+            "worker_pid, worker_birth_identity, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?, ?)",
+            (t, lock, future, 12345, "test-birth", int(time.time())),
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
