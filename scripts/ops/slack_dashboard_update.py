@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update one existing Slack dashboard message, only when its content changes.
+"""Create or update one Slack dashboard message when its content changes.
 
 Examples::
 
@@ -39,7 +39,47 @@ DEFAULT_DB = Path("/opt/data/kanban.db")
 DEFAULT_ENV_FILE = Path("/opt/data/.env")
 DEFAULT_STATE = Path("/opt/data/cron/state/slack-dashboard-update.json")
 DEFAULT_CHANNEL = "C0BPXD9TBB7"
-DEFAULT_TS = "1786717991.405699"
+PROFILE_ROWS = (
+    ("default", "Hermes", "🔵"),
+    ("dev", "개발", "🟢"),
+    ("research", "조사", "🟣"),
+    ("plan", "기획문서", "🟠"),
+    ("design", "디자인", "🔴"),
+)
+EXCLUDED_STATUSES = {"archived", "cancelled", "done", "completed", "triage", "internal"}
+STATE_LABELS = {
+    "running": "진행", "blocked": "막힘", "ready": "대기", "todo": "대기",
+    "scheduled": "예약", "review": "검토",
+}
+
+
+def _public_title(task: sqlite3.Row, columns: set[str]) -> str | None:
+    """Return a display-safe title; identifiers are never title fallbacks."""
+    if "title" not in columns or not isinstance(task["title"], str):
+        return None
+    title = " ".join(task["title"].split()).strip()
+    normalized = title.casefold().replace("-", " ").replace("_", " ")
+    if not title or "자기개발" in title or "self development" in normalized:
+        return None
+    return title
+
+
+def _evidence_percent(*, has_attachment: bool, metadata_fields: set[str]) -> int:
+    """Award 25 points per explicit output fact; remaining work stays below 100."""
+    score = 25 * (int(has_attachment) + len(metadata_fields))
+    return min(score, 95)
+
+
+def _structured_evidence(raw: object) -> set[str]:
+    if not isinstance(raw, str) or not raw:
+        return set()
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(value, dict):
+        return set()
+    return {key for key in ("output", "verification", "delivery") if value.get(key)}
 
 
 def _token_from_env_file(path: Path) -> str | None:
@@ -127,12 +167,27 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
     if {"task_id", "status"} <= rc:
         for row in conn.execute("SELECT * FROM task_runs WHERE status='running' ORDER BY id"):
             runs.setdefault(str(row["task_id"]), []).append(row)
+    run_facts: dict[str, set[str]] = {}
+    if {"task_id", "status"} <= rc:
+        for row in conn.execute("SELECT * FROM task_runs"):
+            task_id = str(row["task_id"])
+            fields = _structured_evidence(row["metadata"]) if "metadata" in rc else set()
+            run_facts[task_id] = run_facts.get(task_id, set()) | fields
+    attachment_tasks: set[str] = set()
+    ac = _columns(conn, "task_attachments")
+    if "task_id" in ac:
+        attachment_tasks = {str(row[0]) for row in
+                            conn.execute("SELECT DISTINCT task_id FROM task_attachments")}
     focus: dict[str, str] | None = None
     focus_key: tuple[int, int, str] | None = None
+    profile_focus: dict[str, tuple[tuple[int, int, str], dict[str, str]]] = {}
     for task in tasks:
         task_id = str(task["id"])
         active = runs.get(task_id, [])
         status = str(task["status"] or "")
+        title = _public_title(task, tc)
+        if status in EXCLUDED_STATUSES or title is None:
+            continue
         valid_running = False
         if status == "running":
             run = active[0] if len(active) == 1 else None
@@ -148,11 +203,10 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
         label = ""
         if valid_running:
             rank, label = 0, "진행 중"
-        elif (status == "blocked" and "block_kind" in tc
-                and str(task["block_kind"] or "") == "needs_input"):
-            rank, label = 1, "답변 대기"
-        elif status == "ready":
-            rank, label = 2, "준비됨"
+        elif status == "blocked":
+            rank, label = 1, "막힘"
+        elif status in {"ready", "todo"}:
+            rank, label = 2, "대기"
         try:
             priority = int(task["priority"] or 0) if "priority" in tc else 0
         except (TypeError, ValueError):
@@ -160,20 +214,98 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
         candidate_key = (rank, -priority, task_id)
         if rank < 99 and (focus_key is None or candidate_key < focus_key):
             focus_key = candidate_key
-            focus = {"id": task_id,
-                     "title": str(task["title"] or task_id) if "title" in tc else task_id,
-                     "label": label}
-    return {"focus": focus, "total": len(tasks)}
+            focus = {"id": task_id, "title": title, "label": label}
+        profile = str(task["assignee"] or "default") if "assignee" in tc else "default"
+        if profile == "hermes":
+            profile = "default"
+        if rank < 99 and (profile not in profile_focus or candidate_key < profile_focus[profile][0]):
+            profile_focus[profile] = (candidate_key, {
+                "title": title,
+                "state": "current" if valid_running else "blocked" if rank == 1 else "waiting",
+            })
+    rows = []
+    for key, name, emoji in PROFILE_ROWS:
+        item = profile_focus.get(key)
+        rows.append({"name": name, "emoji": emoji,
+                     "work": item[1] if item is not None else None})
+    remaining = []
+    for task in tasks:
+        status = str(task["status"] or "")
+        title = _public_title(task, tc)
+        if status in EXCLUDED_STATUSES or title is None:
+            continue
+        task_id = str(task["id"])
+        metadata_fields = run_facts.get(task_id, set())
+        percent = _evidence_percent(
+            has_attachment=task_id in attachment_tasks,
+            metadata_fields=metadata_fields,
+        )
+        try:
+            priority = int(task["priority"] or 0) if "priority" in tc else 0
+        except (TypeError, ValueError):
+            priority = 0
+        remaining.append({
+            "id": task_id,
+            "title": title,
+            "percent": percent,
+            "priority": priority,
+            "state_label": STATE_LABELS.get(status, "대기"),
+        })
+    remaining.sort(key=lambda item: (-int(item["priority"]), str(item["id"])))
+    return {"focus": focus, "profiles": rows, "remaining": remaining[:4],
+            "total": len(tasks)}
 
 
 def render(data: dict[str, object]) -> str:
-    focus = data.get("focus")
-    if not isinstance(focus, dict):
+    remaining = data.get("remaining")
+    if not isinstance(remaining, list) or not remaining:
         return "현재 진행 중인 작업이 없어요."
-    return f"현재 집중 · {focus['label']}\n{focus['title']} ({focus['id']})"
+    return "\n".join(_dashboard_lines(data))
 
 
-def render_blocks(text: str) -> list[dict[str, object]]:
+def _profile_line(row: dict[str, object]) -> str:
+    work = row.get("work")
+    wording = "대기 중"
+    if isinstance(work, dict):
+        if work.get("state") == "current":
+            wording = f"현재 작업: {work['title']}"
+        elif work.get("state") == "blocked":
+            wording = f"막힘: {work['title']}"
+        else:
+            wording = f"대기 작업: {work['title']}"
+    return f"{row['emoji']} {row['name']} · {wording}"
+
+
+def _dashboard_lines(data: dict[str, object]) -> list[str]:
+    lines = [_profile_line(row) for row in data.get("profiles", [])
+             if isinstance(row, dict)]
+    lines.extend(
+        f"{number}. [{item['state_label']}] {item['title']} · {item['percent']}%"
+        for number, item in enumerate(data.get("remaining", []), 1)
+        if isinstance(item, dict)
+    )
+    return lines
+
+
+def render_blocks(text: str, data: dict[str, object] | None = None) -> list[dict[str, object]]:
+    if data is not None and isinstance(data.get("profiles"), list):
+        blocks: list[dict[str, object]] = [
+            {"type": "header", "text": {"type": "plain_text", "text": "작업 현황"}},
+        ]
+        for row in data["profiles"]:
+            if not isinstance(row, dict):
+                continue
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                           "text": _profile_line(row)}})
+        remaining = data.get("remaining")
+        if isinstance(remaining, list):
+            blocks.append({"type": "divider"})
+            for number, item in enumerate(remaining, 1):
+                if isinstance(item, dict):
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                                   "text": f"{number}. [{item['state_label']}] "
+                                           f"{item['title']} · {item['percent']}%"}})
+        return blocks
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
 
@@ -279,7 +411,6 @@ def main(argv: list[str] | None = None, *, sender: Callable = slack_sender,
     p.add_argument("--state", type=Path, default=DEFAULT_STATE)
     p.add_argument("--lock", type=Path)
     p.add_argument("--channel", default=DEFAULT_CHANNEL)
-    p.add_argument("--ts", default=DEFAULT_TS)
     p.add_argument("--timeout", type=float, default=5.0)
     p.add_argument("--now", type=int)
     p.add_argument("--smoke", action="store_true")
@@ -295,15 +426,20 @@ def main(argv: list[str] | None = None, *, sender: Callable = slack_sender,
             with contextlib.closing(_read_db(args.db, args.timeout)) as conn:
                 data = compute_dashboard(conn, args.now)
             text = render(data)
-            blocks = render_blocks(text)
+            blocks = render_blocks(text, data)
             current = fingerprint([{"dashboard": text, "blocks": blocks}])  # type: ignore[list-item]
             token = token_getter() or _token_from_env_file(args.env_file)
             if not token:
                 raise RuntimeError("missing token")
             state = _load_state(args.state)
-            ts = state.get("ts", args.ts)
             check = verifier or (slack_message_exists if sender is slack_sender else lambda *unused: True)
             post = poster or slack_poster
+            ts = state.get("ts")
+            if ts is None:
+                ts = _send_with_optional_blocks(
+                    post, (args.channel, text, token, args.timeout), blocks)
+                _save_state(args.state, current, ts)
+                return 0
             if not check(args.channel, ts, token, args.timeout):
                 ts = _send_with_optional_blocks(
                     post, (args.channel, text, token, args.timeout), blocks)

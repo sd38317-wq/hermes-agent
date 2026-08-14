@@ -38,28 +38,216 @@ class DashboardTests(unittest.TestCase):
                 token_getter=lambda: "fake-token", **kwargs)
         return code, out.getvalue()
 
-    def invoke_with_env_file(self, env_file, sender, *, token_getter=lambda: None):
+    def invoke_with_env_file(self, env_file, sender, *, token_getter=lambda: None, poster=None):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = dashboard.main(["--db", str(self.db), "--state", str(self.state),
                 "--lock", str(self.lock), "--now", "2000", "--env-file", str(env_file)],
-                sender=sender, token_getter=token_getter)
+                sender=sender, token_getter=token_getter,
+                poster=poster or (lambda *args: "local-ts"))
         return code, out.getvalue()
 
-    def test_changed_updates_existing_timestamp_then_unchanged_skips(self):
-        calls = []
-        sender = lambda channel, ts, text, token, timeout: calls.append((channel, ts, text, token))
-        self.assertEqual((0, ""), self.invoke(sender))
-        self.assertEqual(1, len(calls))
-        self.assertEqual("C0BPXD9TBB7", calls[0][0])
-        self.assertEqual("1786717991.405699", calls[0][1])
-        self.assertEqual((0, ""), self.invoke(sender))
-        self.assertEqual(1, len(calls))
+    def test_missing_timestamp_posts_once_then_content_change_updates_saved_timestamp(self):
+        posts, updates, checks = [], [], []
+        poster = lambda channel, text, token, timeout: posts.append((channel, text)) or "new-ts"
+        sender = lambda channel, ts, text, token, timeout: updates.append((ts, text))
+        verifier = lambda channel, ts, token, timeout: checks.append(ts) or True
+
+        self.assertEqual((0, ""), self.invoke(sender, poster=poster, verifier=verifier))
+        self.assertEqual(1, len(posts))
+        self.assertEqual([], updates)
+        self.assertEqual([], checks)
+        self.assertEqual("new-ts", json.loads(self.state.read_text())["ts"])
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES ('task','새 작업','dev','ready',NULL,NULL,NULL,1)")
+            conn.commit()
+        self.assertEqual((0, ""), self.invoke(sender, poster=poster, verifier=verifier))
+        self.assertEqual(1, len(posts))
+        self.assertEqual(["new-ts"], checks)
+        self.assertEqual("new-ts", updates[0][0])
 
     def test_render_has_korean_no_current_work_text_without_aggregates(self):
         with contextlib.closing(dashboard._read_db(self.db)) as conn:
             text = dashboard.render(dashboard.compute_dashboard(conn, 2000))
         self.assertEqual("현재 진행 중인 작업이 없어요.", text)
+
+    def test_main_posts_one_complete_multiline_dashboard(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")
+            for task_id, title, assignee, status, priority in (
+                    ("one", "API 구현", "dev", "todo", 40),
+                    ("two", "시장 조사", "research", "blocked", 30),
+                    ("three", "기획 정리", "plan", "ready", 20),
+                    ("four", "화면 설계", "design", "todo", 10)):
+                conn.execute(
+                    "INSERT INTO tasks VALUES (?,?,?,?,NULL,NULL,NULL,1,?)",
+                    (task_id, title, assignee, status, priority))
+            conn.commit()
+        posts = []
+
+        def poster(channel, text, token, timeout, *, blocks):
+            posts.append({"channel": channel, "text": text, "blocks": blocks})
+            return "one-message-ts"
+
+        self.assertEqual((0, ""), self.invoke(
+            lambda *args: self.fail("must post, not update"), poster=poster))
+        self.assertEqual(1, len(posts))
+        payload = posts[0]
+        fallback_lines = payload["text"].splitlines()
+        block_text = [block.get("text", {}).get("text", "")
+                      for block in payload["blocks"]]
+        self.assertEqual(9, len(fallback_lines))
+        self.assertEqual(11, len(payload["blocks"]))
+        labels = ("Hermes", "개발", "조사", "기획문서", "디자인")
+        self.assertEqual(list(labels),
+                         [line.split(" ", 1)[1].split(" ·", 1)[0]
+                          for line in fallback_lines[:5]])
+        profile_blocks = [line for line in block_text
+                          if line.startswith(tuple("🔵🟢🟣🟠🔴"))]
+        self.assertEqual(5, len(profile_blocks))
+        self.assertEqual(list(labels),
+                         [line.split(" ", 1)[1].split(" ·", 1)[0]
+                          for line in profile_blocks])
+        titles = ("API 구현", "시장 조사", "기획 정리", "화면 설계")
+        self.assertEqual(list(titles),
+                         [next(title for title in titles if title in line)
+                          for line in fallback_lines[-4:]])
+        queue_blocks = [line for line in block_text if line[:1].isdigit()]
+        self.assertEqual(4, len(queue_blocks))
+        self.assertEqual(list(titles),
+                         [next(title for title in titles if title in line)
+                          for line in queue_blocks])
+        self.assertEqual("header", payload["blocks"][0]["type"])
+        self.assertIn("divider", [block["type"] for block in payload["blocks"]])
+
+    def test_mobile_blocks_have_five_distinct_one_line_profile_rows(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN block_kind TEXT")
+            conn.execute(
+                "INSERT INTO tasks VALUES ('dev-task','API 구현','dev','running',123,1,1900,1,NULL)")
+            conn.execute(
+                "INSERT INTO tasks VALUES ('plan-task','요건 확인','plan','blocked',NULL,NULL,NULL,2,'needs_input')")
+            conn.execute(
+                "INSERT INTO task_runs VALUES (1,'dev-task','dev','running',123,1,NULL,1900,NULL)")
+            conn.commit()
+        with contextlib.closing(dashboard._read_db(self.db)) as conn, \
+                mock.patch.object(dashboard, "_pid_alive", return_value=True):
+            data = dashboard.compute_dashboard(conn, 2000)
+        blocks = dashboard.render_blocks(dashboard.render(data), data)
+        rows = [block["text"]["text"] for block in blocks
+                if block["type"] == "section"][:5]
+
+        self.assertEqual(5, len(rows))
+        self.assertEqual(["Hermes", "개발", "조사", "기획문서", "디자인"],
+                         [row.split(" ", 1)[1].split(" ·", 1)[0] for row in rows])
+        self.assertEqual(5, len({row.split(" ", 1)[0] for row in rows}))
+        self.assertTrue(all("\n" not in row for row in rows))
+        self.assertIn("현재 작업: API 구현", rows[1])
+        self.assertIn("막힘: 요건 확인", rows[3])
+        self.assertIn("대기 중", rows[0])
+        self.assertIn("대기 중", rows[2])
+        self.assertIn("대기 중", rows[4])
+
+    def test_top_four_queue_uses_priority_and_deterministic_evidence_scores(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")
+            conn.execute("ALTER TABLE task_runs ADD COLUMN outcome TEXT")
+            conn.execute("ALTER TABLE task_runs ADD COLUMN metadata TEXT")
+            conn.executescript("""
+                CREATE TABLE task_attachments (
+                  id INTEGER PRIMARY KEY, task_id TEXT, filename TEXT, created_at INTEGER);
+                CREATE TABLE task_events (
+                  id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER);
+            """)
+            for task_id, title, priority in (
+                    ("a", "첫 번째", 50), ("b", "두 번째", 40), ("c", "세 번째", 30),
+                    ("d", "네 번째", 20), ("e", "다섯 번째", 10)):
+                conn.execute(
+                    "INSERT INTO tasks VALUES (?,?,'dev','ready',NULL,NULL,NULL,1,?)",
+                    (task_id, title, priority))
+            evidence = json.dumps({
+                "output": {"artifact": "report"},
+                "verification": {"tests": "passed"},
+                "delivery": {"channel": "slack"},
+            })
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(10,'a','dev','completed',NULL,1,2,2,NULL,'completed',?)", (evidence,))
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(11,'d','dev','done',NULL,1,2,2,NULL,'failed',?)", (evidence,))
+            conn.execute("INSERT INTO task_attachments VALUES (1,'a','proof.txt',2)")
+            conn.execute("INSERT INTO task_attachments VALUES (2,'b','brief.pdf',2)")
+            conn.execute("INSERT INTO task_attachments VALUES (3,'d','draft.txt',2)")
+            conn.execute("INSERT INTO task_events VALUES (1,'a','created','{}',2)")
+            conn.execute("INSERT INTO task_events VALUES (2,'c','heartbeat','{}',2)")
+            conn.commit()
+
+        with contextlib.closing(dashboard._read_db(self.db)) as conn:
+            data = dashboard.compute_dashboard(conn, 2000)
+        self.assertEqual(
+            [("첫 번째", 95), ("두 번째", 25), ("세 번째", 0), ("네 번째", 95)],
+            [(item["title"], item["percent"]) for item in data["remaining"]],
+        )
+        queue_rows = [block["text"]["text"] for block in
+                      dashboard.render_blocks(dashboard.render(data), data)[-4:]]
+        self.assertEqual([
+            "1. [대기] 첫 번째 · 95%", "2. [대기] 두 번째 · 25%",
+            "3. [대기] 세 번째 · 0%", "4. [대기] 네 번째 · 95%",
+        ], queue_rows)
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='done' WHERE id='a'")
+            conn.commit()
+        with contextlib.closing(dashboard._read_db(self.db)) as conn:
+            promoted = dashboard.compute_dashboard(conn, 2000)
+        self.assertEqual(["두 번째", "세 번째", "네 번째", "다섯 번째"],
+                         [item["title"] for item in promoted["remaining"]])
+
+    def test_render_excludes_internal_identifiers_statuses_logs_and_self_development(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN body TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN result TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('CARD-SECRET-42','고객 보고서','dev','running',123,1,1900,1,"
+                "'self-development notes','internal logs: traceback','raw-worker-log')")
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(1,'CARD-SECRET-42','dev','running',123,1,NULL,1900,NULL)")
+            conn.execute(
+                "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
+            conn.execute(
+                "INSERT INTO task_events VALUES "
+                "(1,'CARD-SECRET-42','worker_log','self-development internal logs')")
+            for task_id, title, status in (
+                    ("NO-TITLE", None, "ready"),
+                    ("K-PRIVATE", "[자기개발] 독서", "ready"),
+                    ("E-PRIVATE", "Self Development plan", "ready"),
+                    ("ARCHIVED", "보관 카드", "archived"),
+                    ("TRIAGE", "분류 카드", "triage"),
+                    ("INTERNAL", "내부 카드", "internal")):
+                conn.execute(
+                    "INSERT INTO tasks VALUES (?,?,'dev',?,NULL,NULL,NULL,2,NULL,NULL,NULL)",
+                    (task_id, title, status))
+            conn.commit()
+        with contextlib.closing(dashboard._read_db(self.db)) as conn, \
+                mock.patch.object(dashboard, "_pid_alive", return_value=True):
+            data = dashboard.compute_dashboard(conn, 2000)
+        text = dashboard.render(data)
+        exposed = text + json.dumps(
+            dashboard.render_blocks(text, data), ensure_ascii=False)
+
+        self.assertIn("고객 보고서", exposed)
+        for internal in ("CARD-SECRET-42", "running", "ready", "worker_log",
+                         "internal logs", "raw-worker-log", "self-development",
+                         "NO-TITLE", "K-PRIVATE", "E-PRIVATE", "ARCHIVED", "TRIAGE",
+                         "INTERNAL", "자기개발", "Self Development", "보관 카드",
+                         "분류 카드", "내부 카드"):
+            self.assertNotIn(internal, exposed)
 
     def test_focus_prefers_valid_running_then_needs_input_then_ready(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
@@ -71,24 +259,23 @@ class DashboardTests(unittest.TestCase):
             conn.commit()
         with contextlib.closing(dashboard._read_db(self.db)) as conn, \
                 mock.patch.object(dashboard, "_pid_alive", return_value=True):
-            text = dashboard.render(dashboard.compute_dashboard(conn, 2000))
-        self.assertIn("Do now", text)
-        self.assertNotIn("Need answer", text)
-        self.assertNotIn("Ready task", text)
-        self.assertNotIn("0", text)
+            data = dashboard.compute_dashboard(conn, 2000)
+        self.assertEqual("Do now", data["focus"]["title"])
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute("DELETE FROM task_runs")
             conn.execute("UPDATE tasks SET status='done' WHERE id='running'")
             conn.commit()
         with contextlib.closing(dashboard._read_db(self.db)) as conn:
-            self.assertIn("Need answer", dashboard.render(dashboard.compute_dashboard(conn, 2000)))
+            self.assertEqual(
+                "Need answer", dashboard.compute_dashboard(conn, 2000)["focus"]["title"])
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute("UPDATE tasks SET block_kind='dependency' WHERE id='blocked'")
             conn.commit()
         with contextlib.closing(dashboard._read_db(self.db)) as conn:
-            self.assertIn("Ready task", dashboard.render(dashboard.compute_dashboard(conn, 2000)))
+            self.assertEqual(
+                "Need answer", dashboard.compute_dashboard(conn, 2000)["focus"]["title"])
 
-    def test_blocked_fallback_only_accepts_needs_input_block_kind(self):
+    def test_profile_selection_accepts_normal_blocked_status_before_ready(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute("ALTER TABLE tasks ADD COLUMN block_kind TEXT")
             for task_id, status, block_kind in (
@@ -105,7 +292,7 @@ class DashboardTests(unittest.TestCase):
             conn.commit()
         with contextlib.closing(dashboard._read_db(self.db)) as conn:
             data = dashboard.compute_dashboard(conn, 2000)
-        self.assertEqual("ready", data["focus"]["id"])
+        self.assertEqual("capability", data["focus"]["id"])
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute(
                 "INSERT INTO tasks VALUES ('answer', 'answer', 'dev', 'blocked', "
@@ -128,8 +315,7 @@ class DashboardTests(unittest.TestCase):
 
     def test_unchanged_legacy_state_recreates_missing_message_and_persists_ts(self):
         text = "현재 진행 중인 작업이 없어요."
-        current = dashboard.fingerprint([{"dashboard": text, "blocks": dashboard.render_blocks(text)}])
-        self.state.write_text(json.dumps({"fingerprint": current}), encoding="utf-8")
+        self.state.write_text(json.dumps({"fingerprint": "legacy"}), encoding="utf-8")
         posts = []
         code, output = self.invoke(
             lambda *args: self.fail("must not update a missing message"),
@@ -138,7 +324,9 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual((0, ""), (code, output))
         self.assertEqual([("C0BPXD9TBB7", text)], posts)
-        self.assertEqual({"fingerprint": current, "ts": "new-ts"}, json.loads(self.state.read_text()))
+        saved = json.loads(self.state.read_text())
+        self.assertEqual("new-ts", saved["ts"])
+        self.assertNotEqual("legacy", saved["fingerprint"])
 
     def test_stored_timestamp_is_preferred_and_verified_before_update(self):
         self.state.write_text(json.dumps({"fingerprint": "old", "ts": "stored-ts"}), encoding="utf-8")
@@ -222,19 +410,22 @@ class DashboardTests(unittest.TestCase):
         env_file.chmod(0o600)
         calls = []
         with mock.patch.dict(os.environ, {}, clear=True):
-            code, output = self.invoke_with_env_file(env_file, lambda *args: calls.append(args))
+            code, output = self.invoke_with_env_file(
+                env_file, lambda *args: self.fail("updated"),
+                poster=lambda *args: calls.append(args) or "local-ts")
             self.assertNotIn("OTHER_SECRET", os.environ)
             self.assertNotIn("SLACK_BOT_TOKEN", os.environ)
         self.assertEqual((0, ""), (code, output))
-        self.assertEqual("literal-$OTHER_SECRET", calls[0][3])
+        self.assertEqual("literal-$OTHER_SECRET", calls[0][2])
 
     def test_existing_environment_token_takes_priority_without_reading_env_file(self):
         missing = Path(self.tmp.name) / "must-not-be-read"
         calls = []
         code, output = self.invoke_with_env_file(
-            missing, lambda *args: calls.append(args), token_getter=lambda: "existing-token")
+            missing, lambda *args: self.fail("updated"), token_getter=lambda: "existing-token",
+            poster=lambda *args: calls.append(args) or "local-ts")
         self.assertEqual((0, ""), (code, output))
-        self.assertEqual("existing-token", calls[0][3])
+        self.assertEqual("existing-token", calls[0][2])
 
     def test_env_file_must_be_owned_regular_nonsymlink_mode_0600(self):
         target = Path(self.tmp.name) / "target.env"
