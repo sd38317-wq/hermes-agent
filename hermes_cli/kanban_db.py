@@ -1271,6 +1271,7 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_birth_identity: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1295,6 +1296,10 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_birth_identity=(
+                row["worker_birth_identity"]
+                if "worker_birth_identity" in row.keys() else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1479,6 +1484,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_birth_identity TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -2702,6 +2708,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    run_cols = list(conn.execute("PRAGMA table_info(task_runs)"))
+    if run_cols and "worker_birth_identity" not in {
+        row["name"] for row in run_cols
+    }:
+        _add_column_if_missing(
+            conn, "task_runs", "worker_birth_identity",
+            "worker_birth_identity TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2896,7 +2911,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_birth_identity TEXT,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -4443,18 +4459,21 @@ def _active_run_worker(
     row = conn.execute(
         "SELECT t.current_run_id AS run_id, "
         "       COALESCE(t.worker_pid, r.worker_pid) AS worker_pid, "
-        "       COALESCE(t.claim_lock, r.claim_lock) AS claim_lock "
+        "       COALESCE(t.claim_lock, r.claim_lock) AS claim_lock, "
+        "       r.worker_birth_identity AS worker_birth_identity "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
-        return {"run_id": None, "worker_pid": None, "claim_lock": None}
+        return {"run_id": None, "worker_pid": None, "claim_lock": None,
+                "worker_birth_identity": None}
     return {
         "run_id": int(row["run_id"]) if row["run_id"] else None,
         "worker_pid": int(row["worker_pid"]) if row["worker_pid"] else None,
         "claim_lock": row["claim_lock"],
+        "worker_birth_identity": row["worker_birth_identity"],
     }
 
 
@@ -8766,19 +8785,22 @@ def _process_group_alive(pgid: int) -> bool:
     return False
 
 
-def _same_group_descendants(pid: int) -> "list[int]":
-    """Descendants of ``pid`` that stayed in ``pid``'s own process group.
+def _same_group_descendants(pid: int) -> "list[tuple[int, str]]":
+    """Owned descendants as deepest-first ``(pid, birth_identity)`` pairs.
 
-    The membership test is what keeps a self-reap honest. A helper the run
+    On POSIX, group membership is what keeps a self-reap honest. A helper the run
     forked normally (a shell, a build, a stuck ``git``) inherits the group and
     is part of the run. Anything deliberately detached into its own session —
     which is how ``process_registry`` starts background terminals, and how a
     persistent browser profile or an interactive auth login is launched —
     has its own pgid and is NOT part of the run, no matter who its parent
-    happened to be. Returns [] when the platform or psutil can't tell us.
+    happened to be. Windows has no queryable process-group/session ownership
+    boundary here, so fail closed rather than risk reaping a detached browser
+    or auth process that remains in psutil's ancestry tree. Returns [] when
+    the platform cannot prove containment.
     """
     getpgid = getattr(os, "getpgid", None)
-    if getpgid is None:
+    if sys.platform.startswith("win") or getpgid is None:
         return []
     try:
         own_pgid = getpgid(pid)
@@ -8792,22 +8814,68 @@ def _same_group_descendants(pid: int) -> "list[int]":
         children = psutil.Process(pid).children(recursive=True)
     except Exception:
         return []
-    out: list[int] = []
+    out: list[tuple[int, str, int]] = []
     for child in children:
         cpid = int(child.pid)
         if cpid == pid:
             continue
         try:
-            if getpgid(cpid) == own_pgid:
-                out.append(cpid)
-        except OSError:
+            if own_pgid is not None and getpgid(cpid) != own_pgid:
+                continue
+            identity = _process_birth_identity(cpid)
+            if identity is None:
+                continue
+            depth = 0
+            ancestor = child
+            while int(ancestor.pid) != pid:
+                ancestor = ancestor.parent()
+                if ancestor is None:
+                    depth = -1
+                    break
+                depth += 1
+            if depth >= 0:
+                out.append((cpid, identity, depth))
+        except Exception:
             continue
-    return out
+    out.sort(key=lambda item: item[2], reverse=True)
+    return [(cpid, identity) for cpid, identity, _depth in out]
+
+
+def _process_birth_identity(pid: int) -> Optional[str]:
+    """Return a stable best-effort identity for one incarnation of ``pid``.
+
+    Linux's boot id plus /proc starttime is exact for the lifetime of a boot.
+    Elsewhere psutil's kernel process creation time is the portable fallback.
+    If neither can be read, callers fail closed rather than signal by PID alone.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii"
+            ).strip()
+            stat = Path(f"/proc/{int(pid)}/stat").read_text(
+                encoding="ascii"
+            )
+            # comm is parenthesized and may contain spaces or ')'. Fields after
+            # its final ')' start at proc field 3; starttime is field 22.
+            tail = stat[stat.rfind(")") + 2:].split()
+            starttime = tail[19]
+            if boot_id and starttime:
+                return f"linux:{boot_id}:{starttime}"
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        import psutil
+        created_ns = int(psutil.Process(int(pid)).create_time() * 1_000_000_000)
+        return f"psutil:{created_ns}"
+    except Exception:
+        return None
 
 
 def _reap_run_worker_tree(
     pid: Optional[int],
     claim_lock: Optional[str],
+    worker_birth_identity: Optional[str] = None,
     *,
     signal_fn=None,
     grace_seconds: Optional[float] = None,
@@ -8864,6 +8932,14 @@ def _reap_run_worker_tree(
         return info
     info["host_local"] = True
 
+    current_identity = _process_birth_identity(pid)
+    if not worker_birth_identity or current_identity != worker_birth_identity:
+        info["skipped"] = (
+            "identity_unavailable" if current_identity is None
+            or not worker_birth_identity else "identity_mismatch"
+        )
+        return info
+
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
@@ -8878,7 +8954,15 @@ def _reap_run_worker_tree(
     # return the tool result and exit on its own terms.
     if pid == os.getpid():
         info["skipped"] = "self"
-        for child in _same_group_descendants(pid):
+        for child, child_identity in _same_group_descendants(pid):
+            if _process_birth_identity(child) != child_identity:
+                continue
+            if getpgid is not None and not sys.platform.startswith("win"):
+                try:
+                    if getpgid(child) != getpgid(pid):
+                        continue
+                except OSError:
+                    continue
             terminated, _ = _term_then_kill(
                 lambda sig, _p=child: kill(_p, sig), child,
                 grace_seconds=grace_seconds,
@@ -8898,7 +8982,8 @@ def _reap_run_worker_tree(
         except OSError:
             pgid = None
 
-    if killpg is not None and pgid is not None and pgid == pid:
+    if (not sys.platform.startswith("win") and killpg is not None
+            and pgid is not None and pgid == pid):
         try:
             own_pgid = getpgid(0) if getpgid is not None else None
         except OSError:
@@ -8911,6 +8996,24 @@ def _reap_run_worker_tree(
             info["group_reaped"] = True
             send = lambda sig: killpg(pgid, sig)  # noqa: E731
     else:
+        # The worker shares a process group owned by a launcher/gateway. Keep
+        # that group intact, but individually reap descendants whose ancestry
+        # and group membership still prove they came from this worker.
+        for child, child_identity in _same_group_descendants(pid):
+            if _process_birth_identity(child) != child_identity:
+                continue
+            if getpgid is not None and not sys.platform.startswith("win"):
+                try:
+                    if getpgid(child) != pgid:
+                        continue
+                except OSError:
+                    continue
+            terminated, _ = _term_then_kill(
+                lambda sig, _p=child: kill(_p, sig), child,
+                grace_seconds=grace_seconds,
+            )
+            if terminated:
+                info["descendants_reaped"].append(child)
         send = lambda sig: kill(pid, sig)  # noqa: E731
 
     terminated, sigkill = _term_then_kill(
@@ -8934,6 +9037,7 @@ def _reap_finished_run_worker(
     try:
         info = _reap_run_worker_tree(
             snapshot.get("worker_pid"), snapshot.get("claim_lock"),
+            snapshot.get("worker_birth_identity"),
         )
     except Exception:
         _log.debug(
@@ -9983,25 +10087,76 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+_CAPTURE_WORKER_IDENTITY = object()
+
+
+class _SpawnedWorker(int):
+    """PID carrying the identity captured from that exact Popen incarnation."""
+
+    birth_identity: Optional[str]
+
+    def __new__(cls, pid: int, birth_identity: Optional[str]):
+        value = int.__new__(cls, int(pid))
+        value.birth_identity = birth_identity
+        return value
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    run_id: Optional[int] = None,
+    claim_lock: Optional[str] = None,
+    worker_birth_identity: Any = _CAPTURE_WORKER_IDENTITY,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    if run_id is None or claim_lock is None:
+        row = conn.execute(
+            "SELECT current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
+        claim_lock = row["claim_lock"] if row else None
+    # Direct/internal callers predate spawn tokens and remain useful. Dispatch
+    # always passes an explicit value: a custom bare PID therefore stores NULL
+    # and can never later authorize termination by PID alone.
+    identity = (
+        _process_birth_identity(int(pid))
+        if worker_birth_identity is _CAPTURE_WORKER_IDENTITY
+        else worker_birth_identity
+    )
+    registered = False
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ? "
+            "AND current_run_id = ? AND claim_lock = ? AND status = 'running'",
+            (int(pid), task_id, run_id, claim_lock),
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+        if cur.rowcount == 1:
+            run_cur = conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_birth_identity = ? "
+                "WHERE id = ? AND task_id = ? AND claim_lock = ? "
+                "AND ended_at IS NULL AND status = 'running'",
+                (int(pid), identity, run_id, task_id, claim_lock),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+            registered = run_cur.rowcount == 1
+            if registered:
+                _append_event(
+                    conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id,
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = NULL WHERE id = ? "
+                    "AND current_run_id = ? AND claim_lock = ? AND worker_pid = ?",
+                    (task_id, run_id, claim_lock, int(pid)),
+                )
+    if not registered:
+        _reap_run_worker_tree(int(pid), claim_lock, identity)
+    return registered
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10690,7 +10845,13 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                registered = _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    claimed.current_run_id, claimed.claim_lock,
+                    getattr(pid, "birth_identity", None),
+                )
+                if not registered:
+                    continue
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10843,7 +11004,13 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                registered = _set_worker_pid(
+                    conn, claimed.id, int(pid),
+                    claimed.current_run_id, claimed.claim_lock,
+                    getattr(pid, "birth_identity", None),
+                )
+                if not registered:
+                    continue
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -11365,7 +11532,9 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    # Capture before returning from this Popen incarnation. Looking the PID up
+    # later during dispatch registration could identify a recycled process.
+    return _SpawnedWorker(proc.pid, _process_birth_identity(proc.pid))
 
 
 # ---------------------------------------------------------------------------

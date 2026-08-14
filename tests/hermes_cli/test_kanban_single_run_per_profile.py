@@ -848,7 +848,8 @@ def test_group_reap_waits_for_descendants_after_leader_exits(procs, kb):
         ).fetchone()["claim_lock"]
 
     info = kb._reap_run_worker_tree(
-        leader.pid, lock, grace_seconds=0.2,
+        leader.pid, lock, kb._process_birth_identity(leader.pid),
+        grace_seconds=0.2,
     )
 
     assert info["sigkill"] is True
@@ -904,7 +905,7 @@ def test_reap_never_signals_a_shared_process_group(kb, procs):
         ).fetchone()["claim_lock"]
 
     info = kb._reap_run_worker_tree(
-        shared.pid, lock,
+        shared.pid, lock, kb._process_birth_identity(shared.pid),
         signal_fn=lambda p, s: killed.append((p, s)),
         killpg_fn=lambda g, s: killpg_calls.append((g, s)),
     )
@@ -946,7 +947,7 @@ def test_self_transition_reaps_descendants_but_never_itself(kb, procs):
         ).fetchone()["claim_lock"]
 
     info = kb._reap_run_worker_tree(
-        os.getpid(), lock,
+        os.getpid(), lock, kb._process_birth_identity(os.getpid()),
         killpg_fn=lambda g, s: killpg_calls.append((g, s)),
     )
 
@@ -968,6 +969,177 @@ def test_reap_ignores_a_foreign_host_claim(kb):
     )
     assert killed == []
     assert info["host_local"] is False
+
+
+def test_reap_fails_closed_when_worker_birth_identity_changed(kb, monkeypatch):
+    """A recycled same-host PID must never receive a signal."""
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(kb, "_process_birth_identity", lambda pid: "boot-b:200")
+
+    info = kb._reap_run_worker_tree(
+        424242,
+        f"{kb._claimer_id().split(':', 1)[0]}:claim",
+        "boot-a:100",
+        signal_fn=lambda p, s: killed.append((p, s)),
+    )
+
+    assert killed == []
+    assert info["skipped"] == "identity_mismatch"
+
+
+def test_worker_pid_registration_is_cas_bound_to_exact_run(kb, monkeypatch):
+    """A late spawn cannot attach itself to a successor run."""
+    reaped: list[tuple[int, str, str]] = []
+    monkeypatch.setattr(kb, "_process_birth_identity", lambda pid: f"birth:{pid}")
+    monkeypatch.setattr(
+        kb,
+        "_reap_run_worker_tree",
+        lambda pid, lock, identity, **kw: reaped.append((pid, lock, identity)) or {},
+    )
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="registration race", assignee="alpha")
+        stale = _make_running(kb, conn, tid, pid=None)
+        stale_lock = stale.claim_lock
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="reclaimed", run_id=stale.current_run_id)
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL "
+                "WHERE id=?",
+                (tid,),
+            )
+        successor = kb.claim_task(conn, tid)
+        assert successor is not None
+
+        assert kb._set_worker_pid(
+            conn, tid, 424242, stale.current_run_id, stale_lock,
+        ) is False
+        task = kb.get_task(conn, tid)
+        run = kb.get_run(conn, successor.current_run_id)
+
+    assert task.worker_pid is None
+    assert run.worker_pid is None
+    assert reaped == [(424242, stale_lock, "birth:424242")]
+
+
+def test_default_spawn_captures_birth_identity_before_return(kb, monkeypatch, tmp_path):
+    captured: list[int] = []
+
+    class Proc:
+        pid = 424242
+
+    monkeypatch.setattr(kb.subprocess, "Popen", lambda *a, **kw: Proc())
+    monkeypatch.setattr(
+        kb, "_process_birth_identity",
+        lambda pid: captured.append(pid) or f"birth:{pid}",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda path: None)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="spawn identity", assignee="alpha")
+        task = kb.claim_task(conn, tid)
+
+    spawned = kb._default_spawn(task, str(workspace))
+
+    assert int(spawned) == 424242
+    assert spawned.birth_identity == "birth:424242"
+    assert captured == [424242]
+
+
+def test_dispatch_propagates_captured_default_spawn_identity(kb, monkeypatch):
+    monkeypatch.setattr(kb, "_process_birth_identity", lambda pid: "too-late")
+    monkeypatch.setattr(
+        kb, "_default_spawn",
+        lambda *a, **kw: kb._SpawnedWorker(424242, "captured-at-popen"),
+    )
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="dispatch identity", assignee="alpha")
+        result = kb.dispatch_once(conn)
+        run = kb.get_run(conn, kb.get_task(conn, tid).current_run_id)
+
+    assert [item[0] for item in result.spawned] == [tid]
+    assert run.worker_birth_identity == "captured-at-popen"
+
+
+def test_custom_bare_pid_is_registered_but_not_authorized_for_termination(
+    kb, monkeypatch,
+):
+    killed: list[int] = []
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: killed.append(pid))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="custom spawn", assignee="alpha")
+        result = kb.dispatch_once(conn, spawn_fn=_spawn_stub(424242))
+        run = kb.get_run(conn, kb.get_task(conn, tid).current_run_id)
+        assert kb.block_task(conn, tid, reason="stop", kind="needs_input")
+
+    assert [item[0] for item in result.spawned] == [tid]
+    assert run.worker_pid == 424242
+    assert run.worker_birth_identity is None
+    assert killed == []
+
+
+def test_shared_group_reaps_owned_descendants_before_worker(kb, monkeypatch):
+    """Shared-group children are individually reaped child-first."""
+    calls: list[int] = []
+    monkeypatch.setattr(kb, "_process_birth_identity", lambda pid: "birth")
+    monkeypatch.setattr(
+        kb, "_same_group_descendants",
+        lambda pid: [(303, "birth:303"), (202, "birth:202")],
+    )
+    monkeypatch.setattr(
+        kb,
+        "_term_then_kill",
+        lambda send, pid, **kw: (send(15), calls.append(pid), (True, False))[2],
+    )
+    monkeypatch.setattr(kb.os, "getpgid", lambda pid: 99)
+    monkeypatch.setattr(kb, "_process_birth_identity", lambda pid: f"birth:{pid}")
+
+    info = kb._reap_run_worker_tree(
+        101,
+        f"{kb._claimer_id().split(':', 1)[0]}:claim",
+        "birth:101",
+        signal_fn=lambda pid, sig: None,
+        killpg_fn=lambda pgid, sig: pytest.fail("shared group must be preserved"),
+    )
+
+    assert calls == [303, 202, 101]
+    assert info["descendants_reaped"] == [303, 202]
+
+
+@pytest.mark.parametrize("failure", ["identity", "detached"])
+def test_descendant_is_rechecked_immediately_before_signal(kb, monkeypatch, failure):
+    killed: list[int] = []
+    monkeypatch.setattr(kb, "_same_group_descendants", lambda pid: [(202, "birth:old")])
+    monkeypatch.setattr(
+        kb, "_process_birth_identity",
+        lambda pid: "birth:worker" if pid == 101 else (
+            "birth:new" if failure == "identity" else "birth:old"
+        ),
+    )
+    monkeypatch.setattr(
+        kb.os, "getpgid",
+        lambda pid: 100 if pid in (0, 101) else (200 if failure == "detached" else 100),
+    )
+    monkeypatch.setattr(
+        kb, "_term_then_kill",
+        lambda send, pid, **kw: (send(15), (True, False))[1],
+    )
+
+    kb._reap_run_worker_tree(
+        101, f"{kb._claimer_id().split(':', 1)[0]}:claim", "birth:worker",
+        signal_fn=lambda pid, sig: killed.append(pid),
+    )
+
+    assert 202 not in killed
+
+
+def test_windows_descendant_reap_fails_closed_without_job_boundary(kb, monkeypatch):
+    """An ancestry-only Windows tree must not authorize browser/auth cleanup."""
+    monkeypatch.setattr(kb.sys, "platform", "win32")
+    monkeypatch.delattr(kb.os, "getpgid", raising=False)
+
+    assert kb._same_group_descendants(424242) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1147,7 +1319,12 @@ def test_production_run102_fresh_claim_blocks_run105_and_block_reaps_tree(
             )
 
     with kb.connect_closing() as conn:
-        first = kb.dispatch_once(conn, spawn_fn=_spawn_stub(run102.pid))
+        first = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *a, **kw: kb._SpawnedWorker(
+                run102.pid, kb._process_birth_identity(run102.pid),
+            ),
+        )
     assert [task_id for task_id, _, _ in first.spawned] == [t_5ae6f80e]
 
     with kb.connect_closing() as conn:
