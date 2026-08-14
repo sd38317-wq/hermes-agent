@@ -10,6 +10,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+* ``transient`` closes the attempt and returns to the waiting pool, while
+  retaining the same recurrence breaker and parent gating.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -53,6 +55,63 @@ def _make_running_again(conn, tid):
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", [None, "needs_input", "capability"])
+def test_human_block_kinds_remain_sticky(kanban_home: Path, kind: str | None) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="human needed", kind=kind)
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_repeated_transient_blocks_triage_instead_of_hot_looping(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="temporary", kind="transient")
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+
+        assert kb.block_task(conn, tid, reason="temporary", kind="transient")
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+
+
+def test_transient_block_with_unfinished_parent_stays_gated(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = _running_task(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+
+        assert kb.block_task(conn, child, reason="retry later", kind="transient")
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_legacy_sticky_transient_block_recovers_on_tick(
+    kanban_home: Path,
+) -> None:
+    """Rows written before transient blocks requeued directly must self-heal."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="temporary", kind="needs_input")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'transient' WHERE id = ?",
+                (tid,),
+            )
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 
@@ -108,5 +167,3 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
-

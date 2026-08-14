@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 
 import pytest
@@ -19,10 +18,6 @@ def isolated_kanban_home(monkeypatch):
     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
     from hermes_cli import kanban_db
     yield kanban_db, test_home
     # Cleanup is best-effort; tempfile dir survives but pytest isolation
@@ -91,5 +86,3 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
         )
     assert task_id not in res.auto_assigned_default
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
-
-

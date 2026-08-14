@@ -115,7 +115,9 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``needs_input``  — needs a human decision/answer it cannot derive.
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
-#   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``transient``    — a flaky/temporary failure; close/reap this attempt and
+#                        return it to the dispatchable pool (subject to parent
+#                        and per-profile guards) for a later tick.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
@@ -385,6 +387,18 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # stops the duplication; once no duplicate is spawned the pressure eases, the
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
+
+# Cards at or below this priority are opportunistic self-development work:
+# a profile improving its own skills/memory/config when it has nothing else
+# to do. They are deliberately the lowest-priority lane on the board, and a
+# profile must never spend its single run slot on one while real work for
+# that profile is ready or running. See ``_profile_normal_work``.
+SELF_DEV_PRIORITY = -100
+
+# How long a terminal transition waits for a reaped worker to die after
+# SIGTERM before escalating to SIGKILL. Matches the reclaim/max-runtime
+# grace so every kill path gives a worker the same shutdown budget.
+WORKER_REAP_GRACE_SECONDS = 5.0
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -1763,6 +1777,52 @@ def _dispatch_tick_lock(db_path: Path):
                 pass
             finally:
                 handle.close()
+
+
+@contextlib.contextmanager
+def _dispatch_decision_lock():
+    """Serialize cross-board claim/spawn/PID-persist decisions.
+
+    A per-profile lock set cannot be derived safely from a board snapshot:
+    while a dispatcher waits for one of those locks, a task can be created or
+    reassigned to a profile absent from the snapshot.  The later claim would
+    then run without that profile's lock.  One shared lock avoids that stale
+    lock-set problem entirely and keeps the cross-board live-run scan and the
+    resulting claim in one correctness boundary.
+
+    This lock covers dispatcher decisions, not worker execution.  Callers must
+    acquire it with no SQLite transaction open so a lock wait never pins a DB
+    snapshot or writer transaction.
+    """
+    lock_path = kanban_home() / "kanban" / ".dispatch-decision.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0)
+                locking = getattr(msvcrt, "locking")
+                locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 # Periodic WAL checkpoint state for the dispatcher tick path. The kanban
@@ -4293,6 +4353,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4302,14 +4363,28 @@ def _end_run(
     explicitly). Returns the closed run_id or ``None`` if no active run
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
+
+    Both halves of "finish the run" — closing the ``task_runs`` row and
+    clearing ``tasks.current_run_id`` — happen here, in the caller's write
+    transaction, so the two can never be observed apart. That pairing is
+    what the dispatcher's single-live-run guard trusts: a task whose
+    pointer is set but whose run row is closed (or vice versa) would
+    otherwise read as permanently in-flight and wedge the profile.
+
+    ``run_id`` pins the finish to a specific run. The pointer clear is a
+    CAS on it, so a finish computed for run N is a no-op on a card whose
+    pointer has already moved to run N+1 (the stale run row is still
+    closed — a leaked open run is never what we want to leave behind).
     """
     now = int(time.time())
-    row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if not row or not row["current_run_id"]:
-        return None
-    run_id = int(row["current_run_id"])
+    if run_id is None:
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row or not row["current_run_id"]:
+            return None
+        run_id = int(row["current_run_id"])
+    run_id = int(run_id)
     conn.execute(
         """
         UPDATE task_runs
@@ -4323,6 +4398,7 @@ def _end_run(
                claim_expires = NULL,
                worker_pid    = NULL
          WHERE id = ?
+           AND task_id = ?
            AND ended_at IS NULL
         """,
         (
@@ -4333,10 +4409,13 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            task_id,
         ),
     )
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
     return run_id
 
@@ -4346,6 +4425,262 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+def _active_run_worker(
+    conn: sqlite3.Connection, task_id: str,
+) -> dict[str, Any]:
+    """Snapshot the worker owning ``task_id``'s active run.
+
+    Read INSIDE the transaction that finishes a run, because the same
+    transaction blanks ``tasks.worker_pid`` / ``tasks.claim_lock``. Reaping
+    off a post-commit re-read would either find nothing or — worse, if a
+    successor claimed the card in between — target the NEW worker's pid.
+
+    Falls back to the run row's copies of the pid/lock so a card whose task
+    row was already cleared by a partial write still identifies its worker.
+    """
+    row = conn.execute(
+        "SELECT t.current_run_id AS run_id, "
+        "       COALESCE(t.worker_pid, r.worker_pid) AS worker_pid, "
+        "       COALESCE(t.claim_lock, r.claim_lock) AS claim_lock "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {"run_id": None, "worker_pid": None, "claim_lock": None}
+    return {
+        "run_id": int(row["run_id"]) if row["run_id"] else None,
+        "worker_pid": int(row["worker_pid"]) if row["worker_pid"] else None,
+        "claim_lock": row["claim_lock"],
+    }
+
+
+def profile_live_runs(
+    conn: sqlite3.Connection,
+    profile: Optional[str],
+    *,
+    now: Optional[int] = None,
+    exclude_task_ids: "Iterable[str]" = (),
+    limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Return the profile's live in-flight runs, newest-agnostic order.
+
+    A profile is one ``HERMES_HOME`` — one state.db, one browser profile,
+    one auth session. Two workers under the same profile corrupt each
+    other, so the dispatcher gives a profile ONE live run unless an
+    operator explicitly raised ``kanban.max_in_progress_per_profile``. This
+    is the liveness test behind that budget, and it is deliberately a
+    three-part AND:
+
+    * the card is ``running`` and ``current_run_id`` points at a run row
+      that is still OPEN (``ended_at IS NULL``) — a leaked pointer to a
+      closed run, or a ``running`` card with no run at all, is broken
+      bookkeeping, not work in flight;
+    * activity is recent — ``last_heartbeat_at`` (falling back to the run's
+      start, since a just-claimed run hasn't heartbeat yet) within
+      ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``, the same window
+      ``release_stale_claims`` uses to declare a worker wedged;
+    * once recorded, the worker PID is genuinely alive on this host. A fresh
+      host-local claim with no PID yet still occupies the slot: claiming is
+      persisted before spawning, so PID-less is the expected state in that
+      short hand-off window, not evidence that the claim is dead.
+
+    Every clause has to be able to say "not live", or the guard stops being
+    a concurrency limit and becomes a permanent deadlock: a crashed worker
+    would park its profile forever. The reclaim paths own recovering those
+    cards; this function's only job is to not race them.
+
+    The PID probe is skipped for a claim held by another host — we cannot
+    inspect a remote process, and the local PID number means nothing there.
+    Such a run is trusted while its heartbeat stays fresh, which is the
+    same signal the cross-host reclaim path uses.
+
+    ``limit`` stops the scan early once the caller has seen enough to make
+    its decision — the PID probes are syscalls, not free.
+    """
+    if not profile:
+        return []
+    now = int(time.time()) if now is None else int(now)
+    cutoff = now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    excluded = [t for t in exclude_task_ids if t]
+    exclusion_sql = (
+        f" AND t.id NOT IN ({', '.join('?' for _ in excluded)})"
+        if excluded else ""
+    )
+    rows = conn.execute(
+        "SELECT t.id AS task_id, t.current_run_id AS run_id, t.worker_pid, "
+        "       t.claim_lock, "
+        "       COALESCE(t.last_heartbeat_at, r.started_at, t.started_at) "
+        "           AS active_at "
+        "FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.assignee = ? "
+        "  AND r.ended_at IS NULL" + exclusion_sql + " "
+        "ORDER BY t.id",
+        (profile, *excluded),
+    ).fetchall()
+    live: list[dict[str, Any]] = []
+    for row in rows:
+        active_at = row["active_at"]
+        if active_at is None or int(active_at) < cutoff:
+            continue
+        lock = row["claim_lock"] or ""
+        if lock.startswith(host_prefix):
+            if row["worker_pid"] and not _pid_alive(row["worker_pid"]):
+                continue
+        live.append({
+            "task_id": row["task_id"],
+            "run_id": int(row["run_id"]),
+            "worker_pid": (
+                int(row["worker_pid"]) if row["worker_pid"] else None
+            ),
+            "claim_lock": row["claim_lock"],
+            "active_at": int(active_at),
+        })
+        if limit is not None and len(live) >= limit:
+            break
+    return live
+
+
+def profile_live_runs_across_boards(
+    conn: sqlite3.Connection,
+    profile: Optional[str],
+    *,
+    board: Optional[str] = None,
+    exclude_task_ids: "Iterable[str]" = (),
+    limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Return ``profile``'s live runs from every board DB.
+
+    Task contents remain board-local; this reads only the narrow liveness
+    projection used to protect shared profile state.  The caller holds the
+    profile dispatch lock, so its scan and subsequent claim decision cannot
+    race another board dispatcher for the same profile.
+    """
+    if not profile:
+        return []
+    current_row = conn.execute("PRAGMA database_list").fetchone()
+    current_path = (
+        Path(current_row[2]).resolve()
+        if current_row and current_row[2]
+        else None
+    )
+    live: list[dict[str, Any]] = []
+    seen_paths: set[Path] = set()
+    for metadata in list_boards():
+        db_path = Path(metadata["db_path"]).expanduser().resolve()
+        if db_path in seen_paths or not db_path.exists():
+            continue
+        seen_paths.add(db_path)
+        remaining = None if limit is None else max(limit - len(live), 0)
+        if remaining == 0:
+            break
+        is_current = current_path is not None and db_path == current_path
+        excluded = exclude_task_ids if is_current else ()
+        if is_current:
+            board_live = profile_live_runs(
+                conn, profile, exclude_task_ids=excluded, limit=remaining,
+            )
+        else:
+            with connect_closing(db_path=db_path) as other_conn:
+                board_live = profile_live_runs(
+                    other_conn, profile, limit=remaining,
+                )
+        for run in board_live:
+            run["board"] = metadata["slug"]
+        live.extend(board_live)
+    # Explicit ``connect(db_path=...)`` callers are not required to register
+    # that path as a named board.  The supplied connection is nevertheless
+    # authoritative for the claim currently being decided, so scan it once
+    # when the registry did not.  Without this fallback, two direct claims in
+    # an unregistered DB can both take the same profile slot.
+    if current_path is not None and current_path not in seen_paths:
+        remaining = None if limit is None else max(limit - len(live), 0)
+        if remaining != 0:
+            board_live = profile_live_runs(
+                conn,
+                profile,
+                exclude_task_ids=exclude_task_ids,
+                limit=remaining,
+            )
+            current_board = board or current_path.stem
+            for run in board_live:
+                run["board"] = current_board
+            live.extend(board_live)
+    return live
+
+
+def _profile_normal_work(
+    conn: sqlite3.Connection,
+    profile: Optional[str],
+    *,
+    exclude_task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return a ready/running non-self-development task id for ``profile``.
+
+    Used to keep a ``SELF_DEV_PRIORITY`` card from consuming the profile's
+    single run slot while real work is queued or in flight. "Queued" counts,
+    not just "running": normal work that is merely ``ready`` this tick (held
+    by the respawn guard, a rate-limit cooldown, or the spawn budget) is
+    still ahead of self-development in line, and letting the self-dev card
+    start would hand it the slot the real work is waiting for.
+    """
+    if not profile:
+        return None
+    current_row = conn.execute("PRAGMA database_list").fetchone()
+    current_path = (
+        Path(current_row[2]).resolve()
+        if current_row and current_row[2]
+        else None
+    )
+    seen_paths: set[Path] = set()
+    for metadata in list_boards():
+        db_path = Path(metadata["db_path"]).expanduser().resolve()
+        if db_path in seen_paths or not db_path.exists():
+            continue
+        seen_paths.add(db_path)
+        is_current = current_path is not None and db_path == current_path
+        board_conn = conn if is_current else connect(db_path=db_path)
+        try:
+            row = board_conn.execute(
+                "SELECT id FROM tasks "
+                "WHERE assignee = ? AND status = 'ready' "
+                "  AND priority > ? AND (? IS NULL OR id != ?) "
+                "ORDER BY priority DESC, created_at ASC LIMIT 1",
+                (
+                    profile,
+                    SELF_DEV_PRIORITY,
+                    exclude_task_id if is_current else None,
+                    exclude_task_id if is_current else None,
+                ),
+            ).fetchone()
+            if row:
+                return row["id"]
+
+            # A running row only outranks self-development when it represents
+            # a genuinely live run.  Reuse the canonical open-run + fresh
+            # heartbeat + host-aware PID contract; raw status='running' rows
+            # can be crash debris and must not starve self-development.
+            live_runs = profile_live_runs(
+                board_conn,
+                profile,
+                exclude_task_ids=(exclude_task_id,) if is_current else (),
+            )
+            for live_run in live_runs:
+                normal = board_conn.execute(
+                    "SELECT id FROM tasks WHERE id = ? AND priority > ?",
+                    (live_run["task_id"], SELF_DEV_PRIORITY),
+                ).fetchone()
+                if normal:
+                    return normal["id"]
+        finally:
+            if not is_current:
+                board_conn.close()
+    return None
 
 
 def _synthesize_ended_run(
@@ -4432,6 +4767,15 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
+    task_row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    # Transient blocks are dispatch waits, never human holds. This also
+    # self-heals rows written before block_task began routing transient waits
+    # directly to ready/todo: their historical ``blocked`` event must not pin
+    # them forever after an upgrade.
+    if task_row and task_row["block_kind"] == "transient":
+        return False
     row = conn.execute(
         "SELECT kind FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
@@ -4483,9 +4827,10 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
+    1. The most recent block event was a worker-initiated human/generic
        ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
+       ``kanban_unblock`` (#28712). Transient blocks are deliberately
+       non-sticky, including legacy rows written under the old routing.
 
     2. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
@@ -4577,6 +4922,34 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _direct_claim_profile_slot_available(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_status: str,
+) -> bool:
+    """Return whether a direct claim may consume the profile's default slot.
+
+    The caller holds ``_dispatch_decision_lock``, making this cross-board scan
+    and the subsequent claim one atomic scheduling decision.  Dispatch uses
+    its own lock-held path because it may honor an explicit profile cap above
+    the default of one.
+    """
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ? AND status = ? "
+        "AND claim_lock IS NULL",
+        (task_id, source_status),
+    ).fetchone()
+    if row is None or not row["assignee"]:
+        return True
+    return not profile_live_runs_across_boards(
+        conn,
+        row["assignee"],
+        exclude_task_ids=(task_id,),
+        limit=1,
+    )
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4589,6 +4962,29 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "kanban claim cannot wait for the decision lock inside a "
+            "SQLite transaction"
+        )
+    with _dispatch_decision_lock():
+        if not _direct_claim_profile_slot_available(
+            conn, task_id, source_status="ready",
+        ):
+            return None
+        return _claim_task_lock_held(
+            conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
+        )
+
+
+def _claim_task_lock_held(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Claim an implementation task while the shared decision lock is held."""
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4644,12 +5040,13 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   last_heartbeat_at = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4717,6 +5114,29 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "kanban review claim cannot wait for the decision lock inside a "
+            "SQLite transaction"
+        )
+    with _dispatch_decision_lock():
+        if not _direct_claim_profile_slot_available(
+            conn, task_id, source_status="review",
+        ):
+            return None
+        return _claim_review_task_lock_held(
+            conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer,
+        )
+
+
+def _claim_review_task_lock_held(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Claim a review task while the shared decision lock is held."""
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4744,12 +5164,13 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   last_heartbeat_at = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4801,6 +5222,10 @@ def _retry_status_for_run(
     other and legacy runs retry from ``ready``. Keeping this decision in one
     place prevents crash/timeout/reclaim paths from silently converting a
     reviewer run into an implementation run.
+
+    This is the run's *provenance* — which lane it came from. Callers that
+    actually move the card must use :func:`_reclaim_landing_status`, which
+    re-gates the answer on parent completion.
     """
     if run_id is None:
         row = conn.execute(
@@ -4823,6 +5248,26 @@ def _retry_status_for_run(
     if not isinstance(payload, dict):
         payload = {}
     return "review" if payload.get("source_status") == "review" else "ready"
+
+
+def _reclaim_landing_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int] = None,
+) -> str:
+    """Phase a reclaimed card is actually moved to: provenance, re-gated.
+
+    Every reclaim (TTL, crash, heartbeat-stale, max-runtime, operator,
+    failure counter) restores "where this run retries from". Without the
+    parent re-gate a dependency-blocked card reappears in the Ready lane and
+    the next dispatcher tick treats it as dispatchable work — cards moved to
+    dependency-gated ``todo`` were seen re-promoted before their parent had
+    finished. ``recompute_ready`` lifts it out of ``todo`` once the parents
+    are done, exactly as it does for :func:`unblock_task`.
+    """
+    if _landing_status_after_parents(conn, task_id) != "ready":
+        return "todo"
+    return _retry_status_for_run(conn, task_id, run_id)
 
 
 def goal_run_status(
@@ -5014,7 +5459,7 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
-            retry_status = _retry_status_for_run(conn, row["id"])
+            retry_status = _reclaim_landing_status(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -5106,7 +5551,7 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
-        retry_status = _retry_status_for_run(conn, task_id)
+        retry_status = _reclaim_landing_status(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
@@ -5402,6 +5847,10 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        # Snapshot the worker BEFORE the UPDATE below blanks worker_pid /
+        # claim_lock, so the post-commit reap targets THIS run's worker and
+        # can never reach a successor's.
+        worker_snapshot = _active_run_worker(conn, task_id)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5456,6 +5905,7 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            run_id=worker_snapshot["run_id"],
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -5512,6 +5962,12 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+    # The run is durably finished — reap its worker process tree. Done
+    # AFTER the commit (never while holding BEGIN IMMEDIATE: the grace
+    # window would stall every other writer on the board) and from the
+    # in-txn snapshot, so a worker that stops reporting after calling
+    # complete can't linger and hold its profile's run slot hostage.
+    _reap_finished_run_worker(task_id, worker_snapshot)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6153,9 +6609,12 @@ def block_task(
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
       forcing a human-in-the-loop triage decision.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
+    * ``transient`` — closes/reaps the current attempt and returns the task to
+      its resumable waiting phase (or ``todo`` while parents are unfinished).
+      Normal dispatch guards still apply, including the one-live-run profile
+      guard. It participates in the same recurrence breaker, so a task that
+      repeatedly transient-blocks eventually escalates to ``triage`` instead
+      of hot-looping forever.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -6184,6 +6643,18 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+        # Snapshot the worker before any route blanks worker_pid / claim_lock.
+        worker_snapshot = _active_run_worker(conn, task_id)
+
+        # Unblock-loop counter, computed for every route so the dependency
+        # route can share the single post-commit tail below. Only the
+        # truly-blocked routes read it: block_task fires from running/ready
+        # (i.e. AFTER an unblock returned the task to the work pool), so a
+        # stored block_kind matching the incoming kind means blocked →
+        # unblocked → about-to-re-block for the same cause. An un-typed
+        # (None) block compares as "same" to a prior un-typed block.
+        same_cause = prev_kind == kind
+        recurrences = prev_recurrences + 1 if same_cause else 1
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
@@ -6210,6 +6681,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                run_id=worker_snapshot["run_id"],
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6224,27 +6696,7 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
-
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        elif recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -6268,6 +6720,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                run_id=worker_snapshot["run_id"],
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6281,6 +6734,50 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                },
+                run_id=run_id,
+            )
+        elif kind == "transient":
+            landing_status = _landing_status_after_parents(conn, task_id)
+            target_status = (
+                source_status if landing_status == "ready" else landing_status
+            )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (target_status, kind, recurrences, task_id)
+                if expected_run_id is None
+                else (target_status, kind, recurrences, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="blocked", status="blocked",
+                summary=reason,
+                run_id=worker_snapshot["run_id"],
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="blocked", summary=reason,
+                )
+            _append_event(
+                conn, task_id, "transient_wait",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "source_status": source_status,
+                    "status": target_status,
                 },
                 run_id=run_id,
             )
@@ -6322,6 +6819,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                run_id=worker_snapshot["run_id"],
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6342,6 +6840,11 @@ def block_task(
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
+    # Every route out of ``running`` ends the run, so every route reaps that
+    # run's worker tree — including dependency/transient routes that land in
+    # the waiting pool rather than ``blocked``. A waiting card still has to let
+    # go of its old worker before a later tick may dispatch it.
+    _reap_finished_run_worker(task_id, worker_snapshot)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -6405,6 +6908,7 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    worker_snapshot: Optional[dict[str, Any]] = None
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -6429,6 +6933,10 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        # Capture the exact implementation run before clearing its task-row
+        # ownership fields.  Reaping from a later read can hit a reviewer that
+        # claimed immediately after this transaction committed.
+        worker_snapshot = _active_run_worker(conn, task_id)
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -6506,6 +7014,7 @@ def request_review(
             status="review",
             summary=summary,
             metadata=metadata,
+            run_id=worker_snapshot["run_id"],
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
@@ -6528,6 +7037,7 @@ def request_review(
             },
             run_id=run_id,
         )
+    _reap_finished_run_worker(task_id, worker_snapshot)
     return _ret(True)
 
 
@@ -6550,6 +7060,7 @@ def request_changes(
     if not reason:
         return False, "reason is required"
 
+    worker_snapshot: Optional[dict[str, Any]] = None
     with write_txn(conn):
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
@@ -6562,6 +7073,7 @@ def request_changes(
             return False, "task is not in an active review run"
         if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
             return False, "run_id mismatch"
+        worker_snapshot = _active_run_worker(conn, task_id)
 
         claimed_event = conn.execute(
             "SELECT payload FROM task_events "
@@ -6634,6 +7146,7 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            run_id=worker_snapshot["run_id"],
         )
         _append_event(
             conn,
@@ -6647,6 +7160,7 @@ def request_changes(
             },
             run_id=run_id,
         )
+    _reap_finished_run_worker(task_id, worker_snapshot)
     return True, implementer
 
 
@@ -6780,6 +7294,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
+    worker_snapshot: Optional[dict[str, Any]] = None
     with write_txn(conn):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -6790,6 +7305,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if current and current["status"] == "blocked"
             else "ready"
         )
+        worker_snapshot = _active_run_worker(conn, task_id)
         _reclaim_dangling_run(
             conn, task_id, statuses=("blocked", "scheduled"), now=now,
             note="invariant recovery on unblock",
@@ -6827,7 +7343,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
-        return True
+    _reap_finished_run_worker(task_id, worker_snapshot)
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6845,7 +7362,9 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     clears it.) Returns False when the task is missing or not in ``review``.
     """
     now = int(time.time())
+    worker_snapshot: Optional[dict[str, Any]] = None
     with write_txn(conn):
+        worker_snapshot = _active_run_worker(conn, task_id)
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -6895,7 +7414,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "review_reopened",
             payload if payload != {"status": "ready"} else None,
         )
-        return True
+    _reap_finished_run_worker(task_id, worker_snapshot)
+    return True
 
 
 def invalidate_descendants_for_parent_reopen(
@@ -7928,6 +8448,21 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_profile_busy: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks deferred because their profile's live-run budget is full.
+
+    Each entry is ``(task_id, assignee, busy_task_id)``. The budget is ONE
+    by default: a profile is one ``HERMES_HOME`` — one state.db, one browser
+    profile, one auth session — so a second concurrent worker under the same
+    profile corrupts the first. ``kanban.max_in_progress_per_profile`` raises
+    it for operators who explicitly want the fan-out. Not operator-actionable:
+    the card dispatches on a later tick once an in-flight run finishes.
+    See :func:`profile_live_runs`."""
+    skipped_self_dev_deferred: list[tuple[str, str]] = field(default_factory=list)
+    """Priority ``SELF_DEV_PRIORITY`` cards deferred because normal work for
+    the same profile is ready or running. Each entry is
+    ``(task_id, assignee)``. Self-development is what a profile does with an
+    idle slot, never something it takes the slot away from real work for."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8153,35 +8688,268 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
-
-    for _ in range(10):
-        if not _pid_alive(pid):
-            info["terminated"] = True
-            return info
-        time.sleep(0.5)
-
-    if _pid_alive(pid):
-        try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
-        except (ProcessLookupError, OSError):
-            return info
-
-    info["terminated"] = not _pid_alive(pid)
+    terminated, sigkill = _term_then_kill(
+        lambda sig: kill(int(pid), sig), int(pid),
+    )
+    info["terminated"] = terminated
+    info["sigkill"] = sigkill
     return info
+
+
+def _term_then_kill(
+    send,
+    pid: int,
+    *,
+    grace_seconds: Optional[float] = None,
+    alive_fn=None,
+) -> "tuple[bool, bool]":
+    """SIGTERM, wait for ``pid`` to die, then SIGKILL. Best-effort.
+
+    ``send(sig)`` delivers the signal. By default ``pid`` is polled; callers
+    signalling a process group can supply ``alive_fn`` so a leader exiting
+    promptly does not hide surviving group members. Returns
+    ``(terminated, sigkill_used)``.
+    """
+    import signal
+
+    try:
+        send(signal.SIGTERM)
+    except ProcessLookupError:
+        # Already gone — that's a successful termination, not a survival.
+        # Reporting it as survival would make the reclaim guard misread a
+        # dead worker as still-alive and defer forever.
+        return True, False
+    except OSError:
+        return False, False
+
+    if grace_seconds is None:
+        grace_seconds = WORKER_REAP_GRACE_SECONDS
+    is_alive = alive_fn if alive_fn is not None else lambda: _pid_alive(pid)
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    while True:
+        if not is_alive():
+            return True, False
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+
+    try:
+        # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
+        # (which maps to TerminateProcess via the stdlib shim).
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        send(_sigkill)
+    except (ProcessLookupError, OSError):
+        return not is_alive(), False
+    return not is_alive(), True
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """Return whether a non-zombie member of POSIX process group *pgid* lives."""
+    getpgid = getattr(os, "getpgid", None)
+    if getpgid is None:
+        return False
+    try:
+        import psutil
+    except Exception:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+    for proc in psutil.process_iter(attrs=("pid",)):
+        member_pid = int(proc.info["pid"])
+        try:
+            if getpgid(member_pid) == pgid and _pid_alive(member_pid):
+                return True
+        except (ProcessLookupError, OSError, psutil.Error):
+            continue
+    return False
+
+
+def _same_group_descendants(pid: int) -> "list[int]":
+    """Descendants of ``pid`` that stayed in ``pid``'s own process group.
+
+    The membership test is what keeps a self-reap honest. A helper the run
+    forked normally (a shell, a build, a stuck ``git``) inherits the group and
+    is part of the run. Anything deliberately detached into its own session —
+    which is how ``process_registry`` starts background terminals, and how a
+    persistent browser profile or an interactive auth login is launched —
+    has its own pgid and is NOT part of the run, no matter who its parent
+    happened to be. Returns [] when the platform or psutil can't tell us.
+    """
+    getpgid = getattr(os, "getpgid", None)
+    if getpgid is None:
+        return []
+    try:
+        own_pgid = getpgid(pid)
+    except OSError:
+        return []
+    try:
+        import psutil
+    except Exception:
+        return []
+    try:
+        children = psutil.Process(pid).children(recursive=True)
+    except Exception:
+        return []
+    out: list[int] = []
+    for child in children:
+        cpid = int(child.pid)
+        if cpid == pid:
+            continue
+        try:
+            if getpgid(cpid) == own_pgid:
+                out.append(cpid)
+        except OSError:
+            continue
+    return out
+
+
+def _reap_run_worker_tree(
+    pid: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    signal_fn=None,
+    grace_seconds: Optional[float] = None,
+    killpg_fn=None,
+) -> dict[str, Any]:
+    """Terminate the worker process tree for ONE finished run.
+
+    A dispatcher-spawned worker gets ``start_new_session=True``, so its pid is
+    its own session and process-group leader. Signalling that group reaps the
+    worker and everything it forked — a shell, a build, a headless browser it
+    launched itself — and reaches nothing else. Anything living in a
+    *different* session (a persistent browser profile, an interactive
+    ``hermes auth`` login) has its own pgid and is never touched. That
+    containment is the whole point: a terminal transition cleans up its own
+    run, it does not log the operator out.
+
+    Four cases, each with its own containment rule:
+
+    ``foreign host``
+        Never signalled. The claim belongs to another machine, so the local
+        pid number names some unrelated local process.
+    ``worker is its own group leader`` (the dispatcher-spawned norm)
+        ``killpg`` the whole group — that group IS the run.
+    ``worker is us`` (a worker calling ``kanban_complete`` on itself)
+        Reap the descendants that stayed in our process group, and never
+        ourselves: suicide-before-reporting is not a completion. This is the
+        common in-process path, and skipping it entirely used to strand every
+        subprocess the run had forked.
+    ``worker shares somebody else's group``
+        Signal that pid alone, never ``killpg`` — the group is the gateway's
+        or a terminal's, and blasting it is exactly how unrelated sessions
+        die.
+
+    Best-effort by construction; the caller treats failure as "the reclaim
+    paths will catch it".
+    """
+    info: dict[str, Any] = {
+        "prev_pid": int(pid) if pid else None,
+        "host_local": False,
+        "group_reaped": False,
+        "terminated": False,
+        "sigkill": False,
+        "descendants_reaped": [],
+        "skipped": None,
+    }
+    if not pid or int(pid) <= 0:
+        info["skipped"] = "no_pid"
+        return info
+    pid = int(pid)
+
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not claim_lock or not str(claim_lock).startswith(host_prefix):
+        info["skipped"] = "foreign_host"
+        return info
+    info["host_local"] = True
+
+    kill = signal_fn if signal_fn is not None else (
+        os.kill if hasattr(os, "kill") else None
+    )
+    if kill is None:
+        info["skipped"] = "no_kill"
+        return info
+    killpg = killpg_fn if killpg_fn is not None else getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+
+    # Self-transition: the worker is finishing its own run in-process. Take
+    # its subprocesses with it, leave the worker itself running so it can
+    # return the tool result and exit on its own terms.
+    if pid == os.getpid():
+        info["skipped"] = "self"
+        for child in _same_group_descendants(pid):
+            terminated, _ = _term_then_kill(
+                lambda sig, _p=child: kill(_p, sig), child,
+                grace_seconds=grace_seconds,
+            )
+            if terminated:
+                info["descendants_reaped"].append(child)
+        return info
+
+    pgid = None
+    if getpgid is not None:  # POSIX only
+        try:
+            pgid = getpgid(pid)
+        except ProcessLookupError:
+            info["terminated"] = True
+            info["skipped"] = "already_gone"
+            return info
+        except OSError:
+            pgid = None
+
+    if killpg is not None and pgid is not None and pgid == pid:
+        try:
+            own_pgid = getpgid(0) if getpgid is not None else None
+        except OSError:
+            own_pgid = None
+        if pgid == own_pgid:
+            # We are inside the group we were about to reap. Signal the
+            # worker alone rather than taking ourselves down with it.
+            send = lambda sig: kill(pid, sig)  # noqa: E731
+        else:
+            info["group_reaped"] = True
+            send = lambda sig: killpg(pgid, sig)  # noqa: E731
+    else:
+        send = lambda sig: kill(pid, sig)  # noqa: E731
+
+    terminated, sigkill = _term_then_kill(
+        send, pid, grace_seconds=grace_seconds,
+        alive_fn=(
+            (lambda: _process_group_alive(pgid))
+            if info["group_reaped"] else None
+        ),
+    )
+    info["terminated"] = terminated
+    info["sigkill"] = sigkill
+    return info
+
+
+def _reap_finished_run_worker(
+    task_id: str, snapshot: Optional[dict[str, Any]],
+) -> None:
+    """Reap the worker of a run this process just finished. Never raises."""
+    if not snapshot or not snapshot.get("worker_pid"):
+        return
+    try:
+        info = _reap_run_worker_tree(
+            snapshot.get("worker_pid"), snapshot.get("claim_lock"),
+        )
+    except Exception:
+        _log.debug(
+            "kanban: worker reap failed for task %s", task_id, exc_info=True,
+        )
+        return
+    if info.get("terminated") or info.get("descendants_reaped"):
+        _log.debug(
+            "kanban: reaped worker pid=%s for task %s (%s%s)",
+            snapshot.get("worker_pid"), task_id,
+            "group" if info.get("group_reaped") else "pid",
+            (
+                f", {len(info['descendants_reaped'])} descendants"
+                if info.get("descendants_reaped") else ""
+            ),
+        )
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -8364,7 +9132,7 @@ def enforce_max_runtime(
                     pass
 
         with write_txn(conn):
-            retry_status = _retry_status_for_run(conn, tid)
+            retry_status = _reclaim_landing_status(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
@@ -8495,7 +9263,7 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
-            retry_status = _retry_status_for_run(conn, tid)
+            retry_status = _reclaim_landing_status(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
@@ -8849,7 +9617,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            retry_status = _retry_status_for_run(conn, row["id"])
+            retry_status = _reclaim_landing_status(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -9087,7 +9855,7 @@ def _record_task_failure(
         if row is None:
             return False
         retry_status = (
-            _retry_status_for_run(conn, task_id, row["current_run_id"])
+            _reclaim_landing_status(conn, task_id, row["current_run_id"])
             if release_claim
             else ("review" if row["status"] == "review" else "ready")
         )
@@ -9538,20 +10306,30 @@ def dispatch_once(
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                reconcile_orphans=reconcile_orphans,
-            )
+            # This can wait behind another board dispatcher, so it must happen
+            # with no SQLite transaction open.  A single shared decision lock
+            # cannot miss profiles created or reassigned while the caller
+            # waits; the cross-board live scan runs only after acquisition.
+            if conn.in_transaction:
+                raise RuntimeError(
+                    "kanban dispatch cannot wait for the decision lock inside "
+                    "a SQLite transaction"
+                )
+            with _dispatch_decision_lock():
+                result = _dispatch_once_locked(
+                    conn,
+                    spawn_fn=spawn_fn,
+                    ttl_seconds=ttl_seconds,
+                    dry_run=dry_run,
+                    max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
+                    failure_limit=failure_limit,
+                    stale_timeout_seconds=stale_timeout_seconds,
+                    board=board,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                    reconcile_orphans=reconcile_orphans,
+                )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
@@ -9665,11 +10443,16 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     spawned = 0
+    # Cards this tick has already committed to each profile. Counted against
+    # the live-run budget below so two cards for the same profile can't both
+    # start inside ONE tick either — the DB scan alone would miss that, and
+    # in dry_run there is nothing in the DB to scan at all.
+    _profile_claimed_here: dict[str, list[str]] = {}
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -9706,6 +10489,34 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+
+    # Live runs a single profile may hold at once. One by default: a profile
+    # is one HERMES_HOME, and two concurrent workers under it share a state.db,
+    # a browser profile, and an auth session. An operator who explicitly set
+    # ``kanban.max_in_progress_per_profile`` has asked for more and gets it —
+    # the bug was the *default* being unbounded, not the knob existing.
+    _live_run_budget = _per_profile_cap if _per_profile_cap is not None else 1
+
+    def _profile_run_slot_holder(assignee: str, task_id: str) -> Optional[str]:
+        """Task id holding ``assignee``'s last free run slot, if it's full."""
+        claimed_here = _profile_claimed_here.get(assignee, [])
+        if len(claimed_here) >= _live_run_budget:
+            return claimed_here[0]
+        # Exclude cards this tick already committed, or a card claimed a
+        # moment ago would be counted twice — once here, once in the scan.
+        live = profile_live_runs_across_boards(
+            conn, assignee, board=board,
+            exclude_task_ids=(task_id, *claimed_here),
+            limit=_live_run_budget,
+        )
+        if len(claimed_here) + len(live) < _live_run_budget:
+            return None
+        return live[0]["task_id"] if live else claimed_here[0]
+
+    def _take_profile_slot(assignee: Optional[str], task_id: str) -> None:
+        if assignee:
+            _profile_claimed_here.setdefault(assignee, []).append(task_id)
+
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -9789,6 +10600,30 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Self-development lane: a priority SELF_DEV_PRIORITY card is what a
+        # profile does with an otherwise-idle slot. Priority ordering alone
+        # isn't enough — normal work that is merely ``ready`` this tick (held
+        # by the respawn guard, a cooldown, or the spawn budget) would let the
+        # self-dev card slip in and take the slot the real work is queued for.
+        if int(row["priority"] or 0) <= SELF_DEV_PRIORITY:
+            if _profile_normal_work(
+                conn, row_assignee, exclude_task_id=row["id"],
+            ) is not None:
+                result.skipped_self_dev_deferred.append(
+                    (row["id"], row_assignee)
+                )
+                continue
+        # One live run per profile. A profile is a single HERMES_HOME: two
+        # concurrent workers share one state.db, one browser profile, and one
+        # auth session, and corrupt each other's run. Only a *live* run holds
+        # the slot (see profile_live_run) — a crashed or stranded worker must
+        # not wedge the profile, that is the reclaim paths' job.
+        slot_holder = _profile_run_slot_holder(row_assignee, row["id"])
+        if slot_holder is not None:
+            result.skipped_profile_busy.append(
+                (row["id"], row_assignee, slot_holder)
+            )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -9813,6 +10648,10 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
+            # Dry-run never claims, so the would-be run is only visible via
+            # this in-tick tally — without it a dry run reports every card
+            # of a profile as spawnable.
+            _take_profile_slot(row_assignee, row["id"])
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -9822,9 +10661,14 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = _claim_task_lock_held(
+            conn, row["id"], ttl_seconds=ttl_seconds,
+        )
         if claimed is None:
             continue
+        # The claim itself takes the profile's run slot, whether or not the
+        # spawn below succeeds — the card is 'running' either way.
+        _take_profile_slot(claimed.assignee, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -9907,7 +10751,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, priority FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -9931,6 +10775,23 @@ def _dispatch_once_locked(
                     (row["id"], row["assignee"], current)
                 )
                 continue
+        # Review workers spend the same profile budget as implementers — the
+        # reviewer is another `hermes -p <profile>` process against the same
+        # HERMES_HOME. Both lanes share one live run per profile.
+        if int(row["priority"] or 0) <= SELF_DEV_PRIORITY:
+            if _profile_normal_work(
+                conn, row["assignee"], exclude_task_id=row["id"],
+            ) is not None:
+                result.skipped_self_dev_deferred.append(
+                    (row["id"], row["assignee"])
+                )
+                continue
+        slot_holder = _profile_run_slot_holder(row["assignee"], row["id"])
+        if slot_holder is not None:
+            result.skipped_profile_busy.append(
+                (row["id"], row["assignee"], slot_holder)
+            )
+            continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
@@ -9944,14 +10805,18 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
+            _take_profile_slot(row["assignee"], row["id"])
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = _claim_review_task_lock_held(
+            conn, row["id"], ttl_seconds=ttl_seconds,
+        )
         if claimed is None:
             continue
+        _take_profile_slot(claimed.assignee, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

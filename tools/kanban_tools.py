@@ -1864,9 +1864,10 @@ KANBAN_BLOCK_SCHEMA = {
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
+        "no agent can do), or 'transient' (close this attempt and return to "
+        "the waiting pool for a later tick; parent/profile guards still apply). "
+        "``reason`` is shown on the board. If a task keeps transient-failing "
+        "or getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
     ),

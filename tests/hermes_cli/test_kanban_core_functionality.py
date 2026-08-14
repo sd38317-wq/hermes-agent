@@ -51,6 +51,13 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _seed_claim_ignoring_profile_slot(conn, task_id, *, claimer):
+    """Seed a deliberate multi-run fixture without weakening public claims."""
+    claimed = kb._claim_task_lock_held(conn, task_id, claimer=claimer)
+    assert claimed is not None
+    return claimed
+
+
 # ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
@@ -419,13 +426,15 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
+        claim_heartbeat = kb.get_task(conn, tid).last_heartbeat_at
+        assert claim_heartbeat is not None
 
         assert not kb.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
         assert not kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.current_run_id == run2.id
-        assert task.last_heartbeat_at is None
+        assert task.last_heartbeat_at == claim_heartbeat
 
         assert kb.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
         assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
@@ -1136,7 +1145,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
         parent_a = kb.create_task(conn, title="retry-empty", assignee="alice")
         kb.claim_task(conn, parent_a)
         parent_b = kb.create_task(conn, title="retry-corrected", assignee="alice")
-        kb.claim_task(conn, parent_b)
+        _seed_claim_ignoring_profile_slot(conn, parent_b, claimer="test:parent-b")
         real = kb.create_task(
             conn, title="real-child", assignee="x", created_by="alice",
         )
@@ -1406,5 +1415,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

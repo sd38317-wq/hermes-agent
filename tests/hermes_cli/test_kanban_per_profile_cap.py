@@ -8,7 +8,6 @@ model / API quota / browser pool from being overwhelmed by a fan-out.
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 
 import pytest
@@ -21,9 +20,6 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
     from hermes_cli import kanban_db
     yield kanban_db
 
@@ -96,5 +92,3 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert len(res2.spawned) == 1
     assert len(res2.skipped_per_profile_capped) == 1
     assert res2.spawned[0][0] != spawned_id  # different task this time
-
-

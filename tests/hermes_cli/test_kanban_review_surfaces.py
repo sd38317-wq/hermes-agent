@@ -11,6 +11,13 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 
 
+def _seed_claim_ignoring_profile_slot(conn, task_id, *, claimer):
+    """Seed a deliberate multi-run fixture without weakening public claims."""
+    claimed = kb._claim_task_lock_held(conn, task_id, claimer=claimer)
+    assert claimed is not None
+    return claimed
+
+
 @pytest.fixture
 def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     home = tmp_path / ".hermes"
@@ -335,8 +342,9 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             assignee="builder",
             goal_mode=True,
         )
-        cli_claimed = kb.claim_task(conn, cli_task, claimer="builder:2")
-        assert cli_claimed is not None
+        cli_claimed = _seed_claim_ignoring_profile_slot(
+            conn, cli_task, claimer="builder:2",
+        )
     monkeypatch.setenv("HERMES_KANBAN_TASK", cli_task)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(cli_claimed.current_run_id))
 
