@@ -205,6 +205,104 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn2.close()
 
 
+def test_notify_delivery_ack_advances_only_after_success(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
+        initial = conn.execute(
+            "SELECT last_event_id, delivered_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ?", (tid,),
+        ).fetchone()
+        assert initial["delivered_event_id"] == initial["last_event_id"]
+        kb.complete_task(conn, tid, result="ok")
+
+        _, claimed_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed"],
+        )
+        assert [event.kind for event in events] == ["completed"]
+        claimed = conn.execute(
+            "SELECT last_event_id, delivered_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ?", (tid,),
+        ).fetchone()
+        assert claimed["last_event_id"] == claimed_cursor
+        assert claimed["delivered_event_id"] == initial["delivered_event_id"]
+
+        kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            new_cursor=claimed_cursor,
+        )
+        delivered = conn.execute(
+            "SELECT delivered_event_id FROM kanban_notify_subs WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert delivered["delivered_event_id"] == claimed_cursor
+    finally:
+        conn.close()
+
+
+def test_notify_delivery_ack_does_not_rewind_newer_claim(kanban_home):
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="x", assignee="w")
+        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        kb._append_event(conn1, tid, "completed", {"summary": "first"})
+        first_old, first_cursor, first_events = kb.claim_unseen_events_for_sub(
+            conn1, task_id=tid, platform="telegram", chat_id="123",
+            kinds=["completed", "blocked"],
+        )
+        assert [event.kind for event in first_events] == ["completed"]
+
+        kb._append_event(conn2, tid, "blocked", {"reason": "later"})
+        _, second_cursor, second_events = kb.claim_unseen_events_for_sub(
+            conn2, task_id=tid, platform="telegram", chat_id="123",
+            kinds=["completed", "blocked"],
+        )
+        assert second_cursor > first_cursor
+        assert [event.kind for event in second_events] == ["blocked"]
+
+        kb.advance_notify_cursor(
+            conn2, task_id=tid, platform="telegram", chat_id="123",
+            old_cursor=first_cursor, new_cursor=second_cursor,
+        )
+        pending = conn2.execute(
+            "SELECT delivered_event_id FROM kanban_notify_subs WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert pending["delivered_event_id"] < first_cursor
+
+        assert kb.rewind_notify_cursor(
+            conn1, task_id=tid, platform="telegram", chat_id="123",
+            claimed_cursor=first_cursor, old_cursor=first_old,
+        )
+        retry_old, retry_cursor, retry_events = kb.claim_unseen_events_for_sub(
+            conn1, task_id=tid, platform="telegram", chat_id="123",
+            kinds=["completed", "blocked"],
+        )
+        assert [event.kind for event in retry_events] == ["completed", "blocked"]
+        kb.advance_notify_cursor(
+            conn1, task_id=tid, platform="telegram", chat_id="123",
+            old_cursor=retry_old, new_cursor=retry_cursor,
+        )
+        cursors = conn1.execute(
+            "SELECT last_event_id, delivered_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ?", (tid,),
+        ).fetchone()
+        assert cursors["last_event_id"] == second_cursor
+        assert cursors["delivered_event_id"] == second_cursor
+    finally:
+        conn1.close()
+        conn2.close()
+
+
 # ---------------------------------------------------------------------------
 # GC + retention
 # ---------------------------------------------------------------------------

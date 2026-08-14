@@ -432,13 +432,23 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    # A successful spawn is a control-plane
+                                    # lifecycle signal, not a user notification.
+                                    # Only wake-only subscriptions consume it;
+                                    # visible subscription modes retain their
+                                    # existing terminal-event set.
+                                    claim_kinds = TERMINAL_KINDS
+                                    if (sub.get("delivery_mode") or "notify") == "wake":
+                                        claim_kinds = TERMINAL_KINDS + (
+                                            "spawned", "coordination_required",
+                                        )
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=claim_kinds,
                                     )
                                     if not events:
                                         continue
@@ -480,6 +490,7 @@ class GatewayKanbanWatchersMixin:
                         # we don't replay forever.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
+                            d.get("old_cursor", 0),
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -531,7 +542,12 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "spawned":
+                            msg = (
+                                f"▶ {board_tag}{tag}Kanban {sub['task_id']} started"
+                                f" — {title}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -759,7 +775,11 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "spawned", "coordination_required", "completed",
+                            "review_requested", "gave_up", "crashed", "timed_out",
+                            "blocked",
+                        )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -791,7 +811,10 @@ class GatewayKanbanWatchersMixin:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
                             _parts = []
+                            if "spawned" in _wake_kinds: _parts.append("started")
+                            if "coordination_required" in _wake_kinds: _parts.append("requires coordination")
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
+                            if "review_requested" in _wake_kinds: _parts.append("requested review")
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
@@ -972,6 +995,7 @@ class GatewayKanbanWatchersMixin:
                         # event on subsequent ticks.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
+                            d.get("old_cursor", 0),
                         )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
@@ -1013,6 +1037,7 @@ class GatewayKanbanWatchersMixin:
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
+        old_cursor: Optional[int] = None,
     ) -> None:
         """Sync helper: advance a subscription's cursor. Runs in to_thread.
 
@@ -1028,6 +1053,7 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+                old_cursor=old_cursor,
                 new_cursor=cursor,
             )
         finally:

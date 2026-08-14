@@ -1511,7 +1511,15 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    delivered_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_notify_acks (
+    task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL DEFAULT '', start_event_id INTEGER NOT NULL,
+    end_event_id INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, start_event_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -2726,6 +2734,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "delivered_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "delivered_event_id",
+                "delivered_event_id INTEGER NOT NULL DEFAULT 0",
+            )
+            # Existing cursors predate separate claim/delivery tracking. Treat
+            # their current cursor as acknowledged so an upgrade does not
+            # replay historical lifecycle events as false exceptions.
+            conn.execute(
+                "UPDATE kanban_notify_subs "
+                "SET delivered_event_id = COALESCE(last_event_id, 0)"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2853,6 +2875,7 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " delivered_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -3575,16 +3598,17 @@ def _inherit_notify_subs(
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
              chat_type, notifier_profile, delivery_mode, delivery_metadata,
-             created_at, last_event_id)
+             created_at, last_event_id, delivered_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
         (
             child_id,
             int(created_at if created_at is not None else time.time()),
+            cursor,
             cursor,
             *parent_ids,
         ),
@@ -11021,8 +11045,9 @@ def add_notify_sub(
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
                  chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
+                 created_at, last_event_id, delivered_event_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0),
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
@@ -11037,6 +11062,7 @@ def add_notify_sub(
                 insert_mode,
                 metadata_json,
                 now,
+                task_id,
                 task_id,
             ),
         )
@@ -11399,13 +11425,52 @@ def advance_notify_cursor(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    old_cursor: Optional[int] = None,
     new_cursor: int,
 ) -> None:
     with write_txn(conn):
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+        row = conn.execute(
+            "SELECT delivered_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return
+        start = int(row["delivered_event_id"] if old_cursor is None else old_cursor)
+        conn.execute(
+            "INSERT INTO kanban_notify_acks "
+            "(task_id, platform, chat_id, thread_id, start_event_id, end_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, platform, chat_id, thread_id, start_event_id) "
+            "DO UPDATE SET end_event_id = MAX(end_event_id, excluded.end_event_id)",
+            (task_id, platform, chat_id, thread_id or "", start, int(new_cursor)),
+        )
+        delivered = int(row["delivered_event_id"])
+        while True:
+            ack = conn.execute(
+                "SELECT end_event_id FROM kanban_notify_acks "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND start_event_id = ?",
+                (task_id, platform, chat_id, thread_id or "", delivered),
+            ).fetchone()
+            if ack is None:
+                break
+            conn.execute(
+                "DELETE FROM kanban_notify_acks "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND start_event_id = ?",
+                (task_id, platform, chat_id, thread_id or "", delivered),
+            )
+            delivered = max(delivered, int(ack["end_event_id"]))
+        conn.execute(
+            "UPDATE kanban_notify_subs "
+            "SET last_event_id = MAX(last_event_id, ?), "
+            "    delivered_event_id = MAX(delivered_event_id, ?) "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (
+                int(new_cursor), delivered, task_id, platform, chat_id,
+                thread_id or "",
+            ),
         )
 
 
@@ -11434,6 +11499,23 @@ def rewind_notify_cursor(
                 int(old_cursor), task_id, platform, chat_id, thread_id or "",
                 int(claimed_cursor),
             ),
+        )
+        if cur.rowcount == 0:
+            # A later range may have been claimed while this delivery was in
+            # flight. Rewind the whole suffix for at-least-once retry rather
+            # than permanently skipping the failed earlier range. Later
+            # successful sends may be duplicated, but no event is lost.
+            cur = conn.execute(
+                "UPDATE kanban_notify_subs "
+                "SET last_event_id = MIN(last_event_id, ?) "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (int(old_cursor), task_id, platform, chat_id, thread_id or ""),
+            )
+        conn.execute(
+            "DELETE FROM kanban_notify_acks "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND start_event_id >= ?",
+            (task_id, platform, chat_id, thread_id or "", int(old_cursor)),
         )
     return cur.rowcount > 0
 

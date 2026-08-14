@@ -25,6 +25,11 @@ from urllib.parse import quote
 
 DEFAULT_DB = Path("/opt/data/kanban.db")
 DEFAULT_STATE = Path("/opt/data/cron/state/kanban-exception-watch.json")
+MANAGED_PROFILES = frozenset({"dev", "productdev", "research", "plan", "design"})
+READY_STALE_SECONDS = 120
+ORCHESTRATION_EVENT_KINDS = frozenset(
+    {"spawned", "completed", "review_requested", "blocked"}
+)
 
 
 def _reject_symlink(path: Path, label: str) -> None:
@@ -113,6 +118,10 @@ def collect_exceptions(conn: sqlite3.Connection, now: int | None = None) -> list
     task_rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
     tasks = {str(r["id"]): r for r in task_rows}
     found: set[tuple[str, str]] = set()
+    managed_ids = {
+        task_id for task_id, row in tasks.items()
+        if "assignee" in tc and str(row["assignee"] or "") in MANAGED_PROFILES
+    }
     for task_id, row in tasks.items():
         status = str(row["status"] or "")
         if status in {"blocked", "triage"}:
@@ -150,6 +159,81 @@ def collect_exceptions(conn: sqlite3.Connection, now: int | None = None) -> list
                 thb, rhb = task["last_heartbeat_at"], active[task_id][0]["last_heartbeat_at"]
                 if thb is not None and rhb is not None and int(thb) != int(rhb):
                     found.add(("heartbeat", task_id))
+
+    # Read-only safety net: only signal; never claim, promote, or bypass gates.
+    event_columns = _columns(conn, "task_events")
+    ready_since: dict[str, int] = {}
+    if {"task_id", "kind", "created_at"} <= event_columns:
+        for row in conn.execute(
+            "SELECT task_id, MAX(created_at) AS changed_at FROM task_events "
+            "WHERE kind IN ('created','promoted','unblocked','status') "
+            "GROUP BY task_id"
+        ):
+            if row["changed_at"] is not None:
+                ready_since[str(row["task_id"])] = int(row["changed_at"])
+
+    actionable: set[str] = set()
+    link_columns = _columns(conn, "task_links")
+    for task_id in managed_ids:
+        task = tasks[task_id]
+        status = str(task["status"] or "")
+        if status == "ready":
+            actionable.add(task_id)
+            created = int(task["created_at"] or now) if "created_at" in tc else now
+            since = ready_since.get(task_id, created)
+            if now - since >= READY_STALE_SECONDS and not active.get(task_id):
+                found.add(("ready_stale", task_id))
+        elif status == "todo" and {"parent_id", "child_id"} <= link_columns:
+            parents = conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+            ).fetchall()
+            known_parents = [
+                tasks.get(str(parent["parent_id"])) for parent in parents
+            ]
+            parent_statuses = [
+                str(parent["status"] or "")
+                for parent in known_parents
+                if parent is not None
+            ]
+            if not parents or (
+                len(parent_statuses) == len(known_parents)
+                and all(status in {"done", "archived"} for status in parent_statuses)
+            ):
+                actionable.add(task_id)
+                found.add(("promotion_drift", task_id))
+
+    managed_running = any(
+        str(tasks[task_id]["status"] or "") == "running"
+        and any(
+            _worker_matches(run, rc) and _worker_matches(tasks[task_id], tc)
+            for run in active.get(task_id, [])
+        )
+        for task_id in managed_ids
+    )
+    if actionable and not managed_running:
+        found.add(("fleet_idle", min(actionable)))
+
+    sub_columns = _columns(conn, "kanban_notify_subs")
+    if (
+        {"id", "task_id", "kind"} <= event_columns
+        and {"task_id", "last_event_id", "delivery_mode"} <= sub_columns
+    ):
+        ack_column = (
+            "s.delivered_event_id"
+            if "delivered_event_id" in sub_columns
+            else "s.last_event_id"
+        )
+        placeholders = ",".join("?" for _ in ORCHESTRATION_EVENT_KINDS)
+        for row in conn.execute(
+            f"SELECT e.task_id FROM task_events e "
+            "JOIN kanban_notify_subs s ON s.task_id = e.task_id "
+            f"WHERE e.kind IN ({placeholders}) AND s.delivery_mode = 'wake' "
+            f"AND e.id > COALESCE({ack_column}, 0) ORDER BY e.task_id",
+            tuple(sorted(ORCHESTRATION_EVENT_KINDS)),
+        ):
+            task_id = str(row["task_id"])
+            if task_id in managed_ids:
+                found.add(("orchestrator_report_missing", task_id))
     return [{"kind": kind, "task": task} for kind, task in sorted(found)]
 
 
@@ -158,14 +242,19 @@ def fingerprint(exceptions: list[dict[str, str]]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def save_state_atomic(path: Path, value: str) -> None:
+def save_state_atomic(path: Path, value: str | set[str]) -> None:
     _reject_symlink(path, "상태")
     path.parent.mkdir(parents=True, exist_ok=True)
     _reject_symlink(path.parent, "상태 디렉터리")
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"fingerprint": value}, fh, sort_keys=True, separators=(",", ":"))
+            payload = (
+                {"fingerprints": sorted(value)}
+                if isinstance(value, set)
+                else {"fingerprint": value}
+            )
+            json.dump(payload, fh, sort_keys=True, separators=(",", ":"))
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -191,6 +280,83 @@ def _old_fingerprint(path: Path) -> str | None:
         return None
 
 
+def _exception_fingerprints(items: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Index each active condition independently for stable deduplication."""
+    return {fingerprint([item]): item for item in items}
+
+
+def emit_coordination_events(
+    db_path: Path,
+    items: list[dict[str, str]],
+    *,
+    now: int,
+    timeout: float = 2.0,
+) -> None:
+    """Append deduplicated internal wake events without changing task state."""
+    if not items:
+        return
+    _reject_symlink(db_path, "DB")
+    grouped: dict[str, set[str]] = {}
+    for item in items:
+        grouped.setdefault(item["task"], set()).add(item["kind"])
+    conn = sqlite3.connect(db_path, timeout=timeout)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={max(1, int(timeout * 1000))}")
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='task_events'"
+        ).fetchone():
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        for task_id, kinds in sorted(grouped.items()):
+            canonical = [{"kind": kind, "task": task_id} for kind in sorted(kinds)]
+            payload = json.dumps(
+                {"kinds": sorted(kinds), "signal_id": fingerprint(canonical)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            exists = conn.execute(
+                "SELECT 1 FROM task_events signal "
+                "WHERE signal.task_id = ? "
+                "AND signal.kind = 'coordination_required' "
+                "AND signal.payload = ? "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM task_events later "
+                "  WHERE later.id > signal.id "
+                "  AND later.kind != 'coordination_required'"
+                ") LIMIT 1",
+                (task_id, payload),
+            ).fetchone()
+            if exists is None:
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "SELECT id, 'coordination_required', ?, ? FROM tasks WHERE id = ?",
+                    (payload, int(now), task_id),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _old_exception_fingerprints(path: Path) -> set[str]:
+    _reject_symlink(path, "상태")
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        values = data.get("fingerprints") if isinstance(data, dict) else None
+        if isinstance(values, list):
+            return {str(value) for value in values}
+    except (OSError, ValueError):
+        pass
+    # A legacy whole-set fingerprint cannot identify individual conditions;
+    # begin the new state format on this tick rather than carrying ambiguity.
+    return set()
+
+
 @contextlib.contextmanager
 def advisory_lock(path: Path):
     _reject_symlink(path, "잠금")
@@ -205,7 +371,13 @@ def advisory_lock(path: Path):
 
 
 def _message(items: list[dict[str, str]]) -> str:
-    kinds = {"human": "사람 확인", "overdue": "기한 초과", "run_card": "실행 불일치", "card_run": "실행 누락", "heartbeat": "하트비트 이상"}
+    kinds = {
+        "human": "사람 확인", "overdue": "기한 초과",
+        "run_card": "실행 불일치", "card_run": "실행 누락",
+        "heartbeat": "하트비트 이상", "ready_stale": "준비 작업 지연",
+        "promotion_drift": "승격 누락", "fleet_idle": "전체 유휴",
+        "orchestrator_report_missing": "총괄 보고 누락",
+    }
     parts = [f"{kinds[k]} {sum(x['kind'] == k for x in items)}건" for k in kinds if any(x["kind"] == k for x in items)]
     ids = ", ".join("".join(c if c.isalnum() or c in "-_." else "?" for c in x["task"])[:32] for x in items[:5])
     return f"칸반 확인이 필요해요: {', '.join(parts)} (카드: {ids})"
@@ -230,13 +402,20 @@ def main(argv: list[str] | None = None) -> int:
         with advisory_lock(lock):
             with contextlib.closing(_read_db(args.db, args.timeout)) as conn:
                 items = collect_exceptions(conn, args.now)
-            current = fingerprint(items)
-            old = _old_fingerprint(args.state)
-            if old == current:
+            current = _exception_fingerprints(items)
+            old = _old_exception_fingerprints(args.state)
+            if old == set(current):
                 return 0
-            save_state_atomic(args.state, current)
-            if items:
-                print(_message(items))
+            new_items = [item for key, item in current.items() if key not in old]
+            emit_coordination_events(
+                args.db,
+                new_items,
+                now=args.now if args.now is not None else int(time.time()),
+                timeout=args.timeout,
+            )
+            save_state_atomic(args.state, set(current))
+            if new_items:
+                print(_message(new_items))
             return 0
     except BlockingIOError:
         return 0

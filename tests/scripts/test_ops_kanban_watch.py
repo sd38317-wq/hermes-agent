@@ -23,7 +23,8 @@ class WatcherTests(unittest.TestCase):
                 """
                 CREATE TABLE tasks (
                   id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,
-                  created_at INTEGER, started_at INTEGER, claim_expires INTEGER,
+                  created_at INTEGER, started_at INTEGER, completed_at INTEGER,
+                  claim_expires INTEGER,
                   worker_pid INTEGER, last_heartbeat_at INTEGER,
                   current_run_id INTEGER, block_kind TEXT, due_at INTEGER
                 );
@@ -31,6 +32,19 @@ class WatcherTests(unittest.TestCase):
                   id INTEGER PRIMARY KEY, task_id TEXT, status TEXT,
                   worker_pid INTEGER, started_at INTEGER, ended_at INTEGER,
                   last_heartbeat_at INTEGER, claim_expires INTEGER
+                );
+                CREATE TABLE task_links (
+                  parent_id TEXT NOT NULL, child_id TEXT NOT NULL,
+                  PRIMARY KEY (parent_id, child_id)
+                );
+                CREATE TABLE task_events (
+                  id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER,
+                  kind TEXT, payload TEXT, created_at INTEGER
+                );
+                CREATE TABLE kanban_notify_subs (
+                  task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT,
+                  last_event_id INTEGER, delivered_event_id INTEGER,
+                  delivery_mode TEXT
                 );
                 """
             )
@@ -147,6 +161,195 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertFalse(self.state.exists())
         self.assertFalse(self.lock.exists())
+
+    def test_stale_ready_for_managed_profile_and_idle_fleet_are_reported(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('R1','x','dev','ready',1800)"
+            )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            exceptions = watch.collect_exceptions(conn, 2000)
+        kinds = {item["kind"] for item in exceptions}
+        self.assertIn("ready_stale", kinds)
+        self.assertIn("fleet_idle", kinds)
+
+    def test_five_active_profiles_are_not_idle(self):
+        profiles = ("dev", "productdev", "research", "plan", "design")
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for index, profile in enumerate(profiles, start=20):
+                task_id = f"P{index}"
+                conn.execute(
+                    "INSERT INTO tasks (id,title,assignee,status,created_at,current_run_id) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (task_id, "x", profile, "running", 1, index),
+                )
+                conn.execute(
+                    "INSERT INTO task_runs (id,task_id,status,started_at,last_heartbeat_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (index, task_id, "running", 1900, 1990),
+                )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
+        self.assertNotIn("fleet_idle", kinds)
+        self.assertNotIn("ready_stale", kinds)
+
+    def test_independent_todo_not_promoted_is_reported_without_mutating(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('Q1','x','research','todo',1900)"
+            )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
+        self.assertIn("promotion_drift", kinds)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual("todo", conn.execute(
+                "SELECT status FROM tasks WHERE id='Q1'"
+            ).fetchone()[0])
+
+    def test_unacknowledged_terminal_event_is_reported_until_cursor_catches_up(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at,completed_at) "
+                "VALUES ('C1','x','design','done',1,1900)"
+            )
+            conn.execute(
+                "INSERT INTO task_events (id,task_id,kind,created_at) "
+                "VALUES (41,'C1','completed',1900)"
+            )
+            conn.execute(
+                "INSERT INTO kanban_notify_subs "
+                "(task_id,platform,chat_id,thread_id,last_event_id,"
+                "delivered_event_id,delivery_mode) "
+                "VALUES ('C1','slack','internal','',41,40,'wake')"
+            )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
+        self.assertIn("orchestrator_report_missing", kinds)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivered_event_id=41 "
+                "WHERE task_id='C1'"
+            )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
+        self.assertNotIn("orchestrator_report_missing", kinds)
+
+    def test_unrelated_change_does_not_reemit_existing_condition(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,status,created_at,block_kind) "
+                "VALUES ('B1','x','blocked',1,'human')"
+            )
+            conn.commit()
+        self.assertIn("B1", self.run_main()[1])
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,status,created_at,block_kind) "
+                "VALUES ('B2','x','blocked',1,'human')"
+            )
+            conn.commit()
+        output = self.run_main()[1]
+        self.assertIn("B2", output)
+        self.assertNotIn("B1", output)
+
+    def test_new_exception_emits_one_internal_coordination_event(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('R1','x','dev','ready',1800)"
+            )
+            conn.commit()
+
+        self.assertEqual(self.run_main()[0], 0)
+        self.assertEqual(self.run_main()[0], 0)
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            events = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id='R1' AND kind='coordination_required'"
+            ).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertIn("ready_stale", events[0][1])
+
+    def test_coordination_event_reemits_after_condition_clears_and_recurs(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('R1','x','dev','ready',1800)"
+            )
+            conn.commit()
+        self.run_main()
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='done' WHERE id='R1'")
+            conn.commit()
+        self.run_main()
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='ready' WHERE id='R1'")
+            conn.execute(
+                "INSERT INTO task_events (task_id,kind,created_at) "
+                "VALUES ('R1','status',1800)"
+            )
+            conn.commit()
+        self.run_main()
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE task_id='R1' AND kind='coordination_required'"
+            ).fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_dead_managed_worker_does_not_suppress_fleet_idle(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id,title,assignee,status,created_at,current_run_id,worker_pid) "
+                "VALUES ('RUN','x','design','running',1,7,99999999)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(id,task_id,status,worker_pid,started_at) "
+                "VALUES (7,'RUN','running',99999999,1)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('READY','x','dev','ready',1999)"
+            )
+            conn.commit()
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
+        self.assertIn("fleet_idle", kinds)
+
+    def test_minimal_legacy_schema_without_events_still_runs(self):
+        legacy = self.db.with_name("legacy.db")
+        legacy_state = self.state.with_name("legacy.json")
+        legacy_lock = self.lock.with_name("legacy.lock")
+        with contextlib.closing(sqlite3.connect(legacy)) as conn:
+            conn.executescript(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, "
+                "block_kind TEXT, created_at INTEGER);"
+                "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, "
+                "status TEXT);"
+                "INSERT INTO tasks VALUES ('B1','blocked','human',1);"
+            )
+            conn.commit()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = watch.main([
+                "--db", str(legacy), "--state", str(legacy_state),
+                "--lock", str(legacy_lock), "--now", "2000",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("B1", out.getvalue())
 
 
 if __name__ == "__main__":

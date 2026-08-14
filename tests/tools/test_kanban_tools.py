@@ -868,7 +868,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
     assert s["user_id_alt"] == "alt-user-9"
     assert s["chat_type"] == "forum"
-    assert s["delivery_mode"] == "notify+wake"
+    assert s["delivery_mode"] == "wake"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

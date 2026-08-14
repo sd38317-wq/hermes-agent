@@ -11,6 +11,7 @@ Residual insight extracted from closed PR #84191 (@MaximCrabbe).
 """
 
 import asyncio
+import os
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -84,6 +85,88 @@ def _make_completed_task(delivery_mode):
         conn.close()
 
 
+def _make_spawned_task(delivery_mode):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake start task",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode=delivery_mode,
+        )
+        assert kb.claim_task(conn, tid) is not None
+        kb._set_worker_pid(conn, tid, os.getpid())
+        return tid
+    finally:
+        conn.close()
+
+
+def _make_review_task(delivery_mode):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake review task",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode=delivery_mode,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="implementation verified",
+            expected_run_id=claimed.current_run_id,
+        )
+        return tid
+    finally:
+        conn.close()
+
+
+def _make_coordination_task(delivery_mode):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake coordination task",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode=delivery_mode,
+        )
+        kb._append_event(
+            conn,
+            tid,
+            "coordination_required",
+            {"kinds": ["fleet_idle"]},
+        )
+        return tid
+    finally:
+        conn.close()
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:
@@ -123,6 +206,58 @@ def test_wake_only_success_advances_cursor_single_wake(tmp_path, monkeypatch):
         "cursor must advance after a successful wake-only delivery"
     )
     assert runner._kanban_sub_fail_counts == {}
+
+
+def test_wake_only_spawned_event_wakes_once_without_text_ping(tmp_path, monkeypatch):
+    """A successful worker spawn wakes its creator once, without chat noise."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-spawn.db"))
+    kb.init_db()
+    tid = _make_spawned_task("wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "worker start is an internal wake, not a text ping"
+    assert len(adapter.handled) == 1
+    assert "started" in adapter.handled[0].text.lower()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.handled) == 1, "the subscription cursor must deduplicate start"
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_wake_only_review_request_wakes_once_without_text_ping(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-review.db"))
+    kb.init_db()
+    _make_review_task("wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert "review" in adapter.handled[0].text.lower()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.handled) == 1
+
+
+def test_wake_only_coordination_event_wakes_without_text_ping(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-coordinate.db"))
+    kb.init_db()
+    _make_coordination_task("wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert "coordination" in adapter.handled[0].text.lower()
 
 
 def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
