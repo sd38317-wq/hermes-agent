@@ -440,7 +440,7 @@ class GatewayKanbanWatchersMixin:
                                     claim_kinds = TERMINAL_KINDS
                                     if (sub.get("delivery_mode") or "notify") == "wake":
                                         claim_kinds = TERMINAL_KINDS + (
-                                            "spawned", "coordination_required",
+                                            "claimed", "spawned", "coordination_required",
                                         )
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
@@ -542,7 +542,12 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "spawned":
+                        if kind == "claimed":
+                            msg = (
+                                f"▶ {board_tag}{tag}Kanban {sub['task_id']} claimed"
+                                f" — {title}"
+                            )
+                        elif kind == "spawned":
                             msg = (
                                 f"▶ {board_tag}{tag}Kanban {sub['task_id']} started"
                                 f" — {title}"
@@ -776,7 +781,7 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
                         _WAKE_KINDS = (
-                            "spawned", "coordination_required", "completed",
+                            "claimed", "spawned", "coordination_required", "completed",
                             "review_requested", "gave_up", "crashed", "timed_out",
                             "blocked",
                         )
@@ -811,6 +816,7 @@ class GatewayKanbanWatchersMixin:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
                             _parts = []
+                            if "claimed" in _wake_kinds: _parts.append("claimed")
                             if "spawned" in _wake_kinds: _parts.append("started")
                             if "coordination_required" in _wake_kinds: _parts.append("requires coordination")
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
@@ -1338,6 +1344,19 @@ class GatewayKanbanWatchersMixin:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
+        retry_model = str(kanban_cfg.get("retry_model") or "").strip() or None
+        retry_provider = str(kanban_cfg.get("retry_provider") or "").strip() or None
+        retry_reasoning_effort = (
+            str(kanban_cfg.get("retry_reasoning_effort") or "").strip() or None
+        )
+        if retry_model:
+            logger.info(
+                "kanban dispatcher: one-shot retry model=%s provider=%s reasoning=%s",
+                retry_model,
+                retry_provider or "profile-default",
+                retry_reasoning_effort or "profile-default",
+            )
+
         # Read stale_timeout_seconds — 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
         try:
@@ -1493,6 +1512,9 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    retry_model=retry_model,
+                    retry_provider=retry_provider,
+                    retry_reasoning_effort=retry_reasoning_effort,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

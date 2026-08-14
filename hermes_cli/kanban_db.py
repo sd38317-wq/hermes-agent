@@ -9520,6 +9520,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    retry_model: Optional[str] = None,
+    retry_provider: Optional[str] = None,
+    retry_reasoning_effort: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9536,6 +9539,23 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    if retry_model is None:
+        # Resolve here rather than only in the gateway watcher: CLI dispatch,
+        # the standalone daemon, and the dashboard dispatch endpoint all call
+        # this public entry point directly and must honor the same policy.
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config() or {}).get("kanban") or {}
+        except Exception:
+            kanban_cfg = {}
+        retry_model = str(kanban_cfg.get("retry_model") or "").strip() or None
+        retry_provider = (
+            str(kanban_cfg.get("retry_provider") or "").strip() or None
+        )
+        retry_reasoning_effort = (
+            str(kanban_cfg.get("retry_reasoning_effort") or "").strip() or None
+        )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -9555,6 +9575,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            retry_model=retry_model,
+            retry_provider=retry_provider,
+            retry_reasoning_effort=retry_reasoning_effort,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9575,6 +9598,9 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                retry_model=retry_model,
+                retry_provider=retry_provider,
+                retry_reasoning_effort=retry_reasoning_effort,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9602,6 +9628,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    retry_model: Optional[str] = None,
+    retry_provider: Optional[str] = None,
+    retry_reasoning_effort: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9849,6 +9878,30 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        if (
+            claimed.consecutive_failures == 1
+            and retry_model
+            and not claimed.model_override
+        ):
+            # One deliberately cheap retry after the first failed attempt.
+            # These overrides live only on the detached Task passed to the
+            # worker spawn; the card's explicit settings remain untouched.
+            claimed.model_override = retry_model
+            claimed.provider_override = retry_provider or None
+            if retry_reasoning_effort and not claimed.reasoning_effort:
+                claimed.reasoning_effort = retry_reasoning_effort
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    claimed.id,
+                    "retry_model_selected",
+                    {
+                        "model": retry_model,
+                        "provider": retry_provider or None,
+                        "reasoning_effort": retry_reasoning_effort or None,
+                        "attempt": 2,
+                    },
+                )
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

@@ -28,7 +28,10 @@ DEFAULT_STATE = Path("/opt/data/cron/state/kanban-exception-watch.json")
 MANAGED_PROFILES = frozenset({"dev", "productdev", "research", "plan", "design"})
 READY_STALE_SECONDS = 120
 ORCHESTRATION_EVENT_KINDS = frozenset(
-    {"spawned", "completed", "review_requested", "blocked"}
+    {
+        "claimed", "spawned", "completed", "review_requested", "blocked",
+        "crashed", "gave_up",
+    }
 )
 
 
@@ -201,6 +204,30 @@ def collect_exceptions(conn: sqlite3.Connection, now: int | None = None) -> list
             ):
                 actionable.add(task_id)
                 found.add(("promotion_drift", task_id))
+            elif parents:
+                created = int(task["created_at"] or now) if "created_at" in tc else now
+                since = ready_since.get(task_id, created)
+                unfinished_ids = [
+                    str(parent["parent_id"])
+                    for parent, parent_row in zip(parents, known_parents)
+                    if parent_row is None
+                    or str(parent_row["status"] or "") not in {"done", "archived"}
+                ]
+                all_parents_working = bool(unfinished_ids) and all(
+                    parent_id in tasks
+                    and str(tasks[parent_id]["status"] or "") == "running"
+                    and any(
+                        _worker_matches(run, rc)
+                        and _worker_matches(tasks[parent_id], tc)
+                        for run in active.get(parent_id, [])
+                    )
+                    for parent_id in unfinished_ids
+                )
+                if now - since >= READY_STALE_SECONDS and not all_parents_working:
+                    # Signal only.  The coordinator decides whether the edge is
+                    # still valid; this watcher never removes a dependency or
+                    # promotes the child itself.
+                    found.add(("dependency_stall", task_id))
 
     managed_running = any(
         str(tasks[task_id]["status"] or "") == "running"
@@ -376,6 +403,7 @@ def _message(items: list[dict[str, str]]) -> str:
         "run_card": "실행 불일치", "card_run": "실행 누락",
         "heartbeat": "하트비트 이상", "ready_stale": "준비 작업 지연",
         "promotion_drift": "승격 누락", "fleet_idle": "전체 유휴",
+        "dependency_stall": "의존성 정체",
         "orchestrator_report_missing": "총괄 보고 누락",
     }
     parts = [f"{kinds[k]} {sum(x['kind'] == k for x in items)}건" for k in kinds if any(x["kind"] == k for x in items)]

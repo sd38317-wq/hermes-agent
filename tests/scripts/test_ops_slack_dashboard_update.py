@@ -302,6 +302,89 @@ class DashboardTests(unittest.TestCase):
             data = dashboard.compute_dashboard(conn, 2000)
         self.assertEqual("answer", data["focus"]["id"])
 
+    def test_review_is_visible_as_profile_focus(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('review','검수 대기','dev','review',NULL,NULL,NULL,1)"
+            )
+            conn.commit()
+
+        with contextlib.closing(dashboard._read_db(self.db)) as conn:
+            data = dashboard.compute_dashboard(conn, 2000)
+
+        dev = next(row for row in data["profiles"] if row["name"] == "개발")
+        self.assertEqual(
+            {"title": "검수 대기", "state": "review"},
+            dev["work"],
+        )
+        self.assertIn("검토: 검수 대기", dashboard.render(data))
+
+    def test_dashboard_warns_on_recovery_dependency_stall_and_queue_imbalance(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")
+            conn.execute(
+                "CREATE TABLE task_events "
+                "(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER)"
+            )
+            for index in range(3):
+                conn.execute(
+                    "INSERT INTO tasks VALUES (?,?, 'dev','ready',NULL,NULL,NULL,1,?)",
+                    (f"dev-{index}", f"개발 작업 {index}", 30 - index),
+                )
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('nas','NAS 복구','research','blocked',NULL,NULL,NULL,1,50)"
+            )
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('child','후속 작업','plan','todo',NULL,NULL,NULL,1,20)"
+            )
+            conn.executemany(
+                "INSERT INTO task_events VALUES (?,?,?,?,?)",
+                (
+                    (1, "nas", "gave_up", "{}", 1900),
+                    (2, "child", "coordination_required",
+                     '{"kinds":["dependency_stall"]}', 1901),
+                    (3, "nas", "commented", "{}", 1902),
+                ),
+            )
+            conn.commit()
+
+        with contextlib.closing(dashboard._read_db(self.db)) as conn:
+            data = dashboard.compute_dashboard(conn, 2000)
+
+        warnings = data["warnings"]
+        self.assertTrue(any("자동복구" in warning and "NAS 복구" in warning
+                            for warning in warnings))
+        self.assertTrue(any("의존성 정체" in warning and "후속 작업" in warning
+                            for warning in warnings))
+        self.assertTrue(any("대기열 불균형" in warning and "개발" in warning
+                            for warning in warnings))
+        rendered = dashboard.render(data)
+        self.assertTrue(all(warning in rendered for warning in warnings))
+
+    def test_non_object_coordination_payload_does_not_break_dashboard(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "CREATE TABLE task_events "
+                "(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('child','후속 작업','plan','todo',NULL,NULL,NULL,1)"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES "
+                "(1,'child','coordination_required','[]')"
+            )
+            conn.commit()
+
+        with contextlib.closing(dashboard._read_db(self.db)) as conn:
+            data = dashboard.compute_dashboard(conn, 2000)
+
+        self.assertEqual([], data["warnings"])
+
     def test_focus_uses_highest_priority_with_deterministic_id_tiebreak(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")

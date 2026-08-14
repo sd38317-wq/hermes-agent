@@ -178,6 +178,19 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
     if "task_id" in ac:
         attachment_tasks = {str(row[0]) for row in
                             conn.execute("SELECT DISTINCT task_id FROM task_attachments")}
+    lifecycle: dict[str, tuple[str, object]] = {}
+    ec = _columns(conn, "task_events")
+    if {"id", "task_id", "kind"} <= ec:
+        payload_sql = "payload" if "payload" in ec else "NULL AS payload"
+        for event in conn.execute(
+            f"SELECT task_id, kind, {payload_sql} FROM task_events "
+            "WHERE kind IN ("
+            "'crashed','gave_up','coordination_required',"
+            "'claimed','spawned','completed','unblocked','status'"
+            ") "
+            "ORDER BY id"
+        ):
+            lifecycle[str(event["task_id"])] = (str(event["kind"]), event["payload"])
     focus: dict[str, str] | None = None
     focus_key: tuple[int, int, str] | None = None
     profile_focus: dict[str, tuple[tuple[int, int, str], dict[str, str]]] = {}
@@ -205,8 +218,10 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
             rank, label = 0, "진행 중"
         elif status == "blocked":
             rank, label = 1, "막힘"
+        elif status == "review":
+            rank, label = 2, "검토"
         elif status in {"ready", "todo"}:
-            rank, label = 2, "대기"
+            rank, label = 3, "대기"
         try:
             priority = int(task["priority"] or 0) if "priority" in tc else 0
         except (TypeError, ValueError):
@@ -221,7 +236,10 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
         if rank < 99 and (profile not in profile_focus or candidate_key < profile_focus[profile][0]):
             profile_focus[profile] = (candidate_key, {
                 "title": title,
-                "state": "current" if valid_running else "blocked" if rank == 1 else "waiting",
+                "state": (
+                    "current" if valid_running else "blocked" if rank == 1
+                    else "review" if status == "review" else "waiting"
+                ),
             })
     rows = []
     for key, name, emoji in PROFILE_ROWS:
@@ -252,7 +270,43 @@ def compute_dashboard(conn: sqlite3.Connection, now: int | None = None) -> dict[
             "state_label": STATE_LABELS.get(status, "대기"),
         })
     remaining.sort(key=lambda item: (-int(item["priority"]), str(item["id"])))
-    return {"focus": focus, "profiles": rows, "remaining": remaining[:4],
+    warnings: list[str] = []
+    public_titles = {
+        str(task["id"]): title
+        for task in tasks
+        if str(task["status"] or "") not in EXCLUDED_STATUSES
+        if (title := _public_title(task, tc)) is not None
+    }
+    for task_id, (kind, raw_payload) in sorted(lifecycle.items()):
+        title = public_titles.get(task_id)
+        if title is None:
+            continue
+        if kind in {"crashed", "gave_up"}:
+            warnings.append(f"⚠ 자동복구 확인: {title}")
+        elif kind == "coordination_required":
+            try:
+                payload = json.loads(raw_payload) if isinstance(raw_payload, str) else {}
+            except ValueError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if "dependency_stall" in payload.get("kinds", []):
+                warnings.append(f"⚠ 의존성 정체: {title}")
+    profile_names = {key: name for key, name, _ in PROFILE_ROWS}
+    queue_counts = {key: 0 for key in profile_names}
+    for task in tasks:
+        profile = str(task["assignee"] or "default") if "assignee" in tc else "default"
+        if profile == "hermes":
+            profile = "default"
+        if profile in queue_counts and str(task["status"] or "") in {"ready", "todo", "review"}:
+            queue_counts[profile] += 1
+    busiest = max(queue_counts, key=lambda key: (queue_counts[key], key))
+    if queue_counts[busiest] >= 3 and queue_counts[busiest] - min(queue_counts.values()) >= 2:
+        warnings.append(
+            f"⚠ 대기열 불균형: {profile_names[busiest]} {queue_counts[busiest]}건"
+        )
+    return {"focus": focus, "profiles": rows, "warnings": warnings,
+            "remaining": remaining[:4],
             "total": len(tasks)}
 
 
@@ -271,6 +325,8 @@ def _profile_line(row: dict[str, object]) -> str:
             wording = f"현재 작업: {work['title']}"
         elif work.get("state") == "blocked":
             wording = f"막힘: {work['title']}"
+        elif work.get("state") == "review":
+            wording = f"검토: {work['title']}"
         else:
             wording = f"대기 작업: {work['title']}"
     return f"{row['emoji']} {row['name']} · {wording}"
@@ -279,6 +335,7 @@ def _profile_line(row: dict[str, object]) -> str:
 def _dashboard_lines(data: dict[str, object]) -> list[str]:
     lines = [_profile_line(row) for row in data.get("profiles", [])
              if isinstance(row, dict)]
+    lines.extend(str(warning) for warning in data.get("warnings", []))
     lines.extend(
         f"{number}. [{item['state_label']}] {item['title']} · {item['percent']}%"
         for number, item in enumerate(data.get("remaining", []), 1)
@@ -297,6 +354,9 @@ def render_blocks(text: str, data: dict[str, object] | None = None) -> list[dict
                 continue
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                            "text": _profile_line(row)}})
+        for warning in data.get("warnings", []):
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                           "text": str(warning)}})
         remaining = data.get("remaining")
         if isinstance(remaining, list):
             blocks.append({"type": "divider"})

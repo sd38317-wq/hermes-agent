@@ -241,6 +241,113 @@ class WatcherTests(unittest.TestCase):
             kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
         self.assertNotIn("orchestrator_report_missing", kinds)
 
+    def test_crash_and_gave_up_reports_are_part_of_orchestration_contract(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('NAS','x','dev','blocked',1)"
+            )
+            conn.executemany(
+                "INSERT INTO task_events (id,task_id,kind,created_at) VALUES (?,?,?,?)",
+                ((51, "NAS", "crashed", 1900), (52, "NAS", "gave_up", 1901)),
+            )
+            conn.execute(
+                "INSERT INTO kanban_notify_subs "
+                "(task_id,platform,chat_id,thread_id,last_event_id,"
+                "delivered_event_id,delivery_mode) "
+                "VALUES ('NAS','slack','internal','',52,50,'wake')"
+            )
+            conn.commit()
+
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            exceptions = watch.collect_exceptions(conn, 2000)
+
+        self.assertIn(
+            {"kind": "orchestrator_report_missing", "task": "NAS"},
+            exceptions,
+        )
+
+    def test_inactive_unfinished_parent_stalls_todo_child_after_two_minutes(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('PARENT','x','research','blocked',1)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('CHILD','x','dev','todo',1800)"
+            )
+            conn.execute(
+                "INSERT INTO task_links (parent_id,child_id) VALUES ('PARENT','CHILD')"
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id,kind,created_at) "
+                "VALUES ('CHILD','created',1800)"
+            )
+            conn.commit()
+
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            exceptions = watch.collect_exceptions(conn, 2000)
+
+        self.assertIn({"kind": "dependency_stall", "task": "CHILD"}, exceptions)
+
+    def test_live_parent_does_not_report_dependency_stall(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id,title,assignee,status,created_at,current_run_id) "
+                "VALUES ('PARENT','x','research','running',1,61)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(id,task_id,status,started_at,last_heartbeat_at) "
+                "VALUES (61,'PARENT','running',1,1999)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('CHILD','x','dev','todo',1800)"
+            )
+            conn.execute(
+                "INSERT INTO task_links (parent_id,child_id) VALUES ('PARENT','CHILD')"
+            )
+            conn.commit()
+
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            exceptions = watch.collect_exceptions(conn, 2000)
+
+        self.assertNotIn({"kind": "dependency_stall", "task": "CHILD"}, exceptions)
+
+    def test_stalled_parent_is_reported_when_a_sibling_parent_is_live(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id,title,assignee,status,created_at,current_run_id) "
+                "VALUES ('LIVE','x','research','running',1,71)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(id,task_id,status,started_at,last_heartbeat_at) "
+                "VALUES (71,'LIVE','running',1,1999)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('STALLED','x','plan','blocked',1)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id,title,assignee,status,created_at) "
+                "VALUES ('CHILD','x','dev','todo',1800)"
+            )
+            conn.executemany(
+                "INSERT INTO task_links (parent_id,child_id) VALUES (?, 'CHILD')",
+                (("LIVE",), ("STALLED",)),
+            )
+            conn.commit()
+
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            exceptions = watch.collect_exceptions(conn, 2000)
+
+        self.assertIn({"kind": "dependency_stall", "task": "CHILD"}, exceptions)
+
     def test_unrelated_change_does_not_reemit_existing_condition(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute(

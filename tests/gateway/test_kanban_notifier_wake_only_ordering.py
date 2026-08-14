@@ -109,6 +109,29 @@ def _make_spawned_task(delivery_mode):
         conn.close()
 
 
+def _make_claimed_task(delivery_mode):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake claimed task",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode=delivery_mode,
+        )
+        assert kb.claim_task(conn, tid) is not None
+        return tid
+    finally:
+        conn.close()
+
+
 def _make_review_task(delivery_mode):
     conn = kb.connect()
     try:
@@ -226,6 +249,24 @@ def test_wake_only_spawned_event_wakes_once_without_text_ping(tmp_path, monkeypa
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.handled) == 1, "the subscription cursor must deduplicate start"
     assert _unseen_terminal_events(tid) == []
+
+
+def test_wake_only_claimed_event_wakes_once_without_waiting_for_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-claimed.db"))
+    kb.init_db()
+    _make_claimed_task("wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert "claimed" in adapter.handled[0].text.lower()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.handled) == 1
 
 
 def test_wake_only_review_request_wakes_once_without_text_ping(tmp_path, monkeypatch):
