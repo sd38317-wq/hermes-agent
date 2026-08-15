@@ -201,6 +201,45 @@ class RuntimeWatchTests(unittest.TestCase):
         }
         self.assertEqual({"A", "B"}, duplicate_tasks)
 
+    def test_all_queries_share_one_sqlite_snapshot(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('A','a','dev','running',1800,1800,70,500,1990,NULL)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(70,'A','dev','running',500,1800,NULL,1990)"
+            )
+            conn.commit()
+
+        reader = watch._read_db(self.db, 1.0)
+        changed = False
+
+        def mutate_after_task_snapshot(statement):
+            nonlocal changed
+            if changed or not statement.startswith("SELECT * FROM tasks"):
+                return
+            changed = True
+            with contextlib.closing(sqlite3.connect(self.db)) as writer:
+                writer.execute("UPDATE tasks SET status='done' WHERE id='A'")
+                writer.execute(
+                    "UPDATE task_runs SET status='done', ended_at=1995 WHERE id=70"
+                )
+                writer.commit()
+
+        reader.set_trace_callback(mutate_after_task_snapshot)
+        try:
+            with watch.pid_probe(lambda pid: True):
+                result = watch.collect_evidence(reader, now=2000)
+        finally:
+            reader.close()
+
+        self.assertTrue(changed)
+        self.assertEqual("PASS", result["status"])
+        self.assertEqual([], result["findings"])
+
     def test_orphan_active_run_is_reported_even_with_another_healthy_task(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute(

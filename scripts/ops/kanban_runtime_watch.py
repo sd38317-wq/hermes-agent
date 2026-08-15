@@ -49,6 +49,7 @@ def _read_db(path: Path, timeout: float) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     conn.execute(f"PRAGMA busy_timeout={max(1, int(timeout * 1000))}")
+    conn.execute("BEGIN")
     return conn
 
 
