@@ -278,6 +278,22 @@ class RuntimeWatchTests(unittest.TestCase):
 
         self.assertNotIn("ready_stale", {item["kind"] for item in result["findings"]})
 
+    def test_recent_reclaim_to_ready_resets_ready_age(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('RECLAIMED','recent','dev','ready',1,NULL,NULL,NULL,NULL,NULL)"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES "
+                "(1,'RECLAIMED','reclaimed','{\"retry_status\":\"ready\"}',1990)"
+            )
+            conn.commit()
+
+        _, result = self.run_main()
+
+        self.assertNotIn("ready_stale", {item["kind"] for item in result["findings"]})
+
     def test_cross_profile_waiting_parent_can_block_an_entire_profile(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.executemany(

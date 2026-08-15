@@ -140,7 +140,7 @@ def collect_evidence(
         selected = {str(row["id"]) for row in tasks}
         for event in conn.execute(
             "SELECT * FROM task_events "
-            "WHERE kind IN ('created','promoted','unblocked','status') "
+            "WHERE kind IN ('created','promoted','unblocked','status','reclaimed') "
             "ORDER BY created_at, id"
         ).fetchall():
             task_id = str(event["task_id"])
@@ -155,6 +155,15 @@ def collect_evidence(
                     payload = {}
                 enters_ready = (
                     isinstance(payload, dict) and payload.get("status") == "ready"
+                )
+            elif kind == "reclaimed" and "payload" in event_columns:
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                enters_ready = (
+                    isinstance(payload, dict)
+                    and payload.get("retry_status") == "ready"
                 )
             if enters_ready:
                 ready_since[task_id] = int(event["created_at"])
