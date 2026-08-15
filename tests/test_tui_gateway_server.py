@@ -5500,7 +5500,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
-                if not release_nested.wait(timeout=5):
+                # Keep the first notification in flight until the assertion
+                # phase releases it.  A five-second self-timeout raced the
+                # test's own waits on loaded CI runners, allowing batch_2 and
+                # batch_3 to be consumed before queue membership was checked.
+                if not release_nested.wait(timeout=30):
                     raise TimeoutError("notification turn was not released")
             return {"final_response": "", "messages": []}
 
@@ -5530,8 +5534,8 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     try:
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
-        assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
+        assert nested_started.wait(timeout=10)
+        threads[0].join(timeout=10)
         assert not threads[0].is_alive()
         # Membership, not order: the completion_queue is process-global, and
         # notification pollers leaked by earlier session.init tests in this
