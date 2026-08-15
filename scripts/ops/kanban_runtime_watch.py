@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import sqlite3
 import time
 from collections import Counter, defaultdict
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 from urllib.parse import quote
@@ -25,6 +26,8 @@ DEFAULT_DB = Path("/opt/data/kanban.db")
 DEFAULT_EVIDENCE = Path("/opt/data/cron/evidence/kanban-runtime-watch.jsonl")
 ACTIVE_STATUSES = ("running", "ready", "blocked", "todo")
 STALE_SECONDS = 120
+MAX_EVIDENCE_RECORD_BYTES = 1024 * 1024
+EVIDENCE_LOCK_TIMEOUT_SECONDS = 0.5
 
 _PID_PROBE: ContextVar[Callable[[int], bool] | None] = ContextVar(
     "kanban_runtime_watch_pid_probe", default=None
@@ -311,11 +314,22 @@ def collect_evidence(
                     detail=f"최신 heartbeat가 {age}",
                 ))
 
-        block_kind = str(_value(task, task_columns, "block_kind") or "")
-        if status == "blocked" and block_kind not in {"", "dependency", "transient"}:
+        raw_block_kind = _value(task, task_columns, "block_kind")
+        block_kind = None if raw_block_kind is None else str(raw_block_kind)
+        if status == "blocked" and block_kind in {None, "needs_input", "capability"}:
+            detail = (
+                "사람만 해소 가능한 legacy 미분류 막힘"
+                if block_kind is None
+                else f"사람만 해소 가능한 block_kind={block_kind}"
+            )
             findings.append(_finding(
                 "needs_input", task_id, human_only=True,
-                detail=f"사람만 해소 가능한 block_kind={block_kind}",
+                detail=detail,
+            ))
+        elif status == "blocked" and block_kind not in {"dependency", "transient"}:
+            findings.append(_finding(
+                "invalid_block_kind", task_id,
+                detail=f"알 수 없는 block_kind={block_kind}",
             ))
 
         if status in {"todo", "ready"} and not assignee and not parents_by_child.get(task_id):
@@ -426,7 +440,12 @@ def _error_record(now: int, query_count: int, detail: str) -> dict[str, object]:
         },
         "findings": [_finding("insufficient_evidence", "board", detail=detail)],
         "remediation_plan": [],
-        "external_alerts": [],
+        "external_alerts": [{
+            "cause": f"감시기가 충분한 증거를 수집하지 못했습니다: {detail}",
+            "impact": "칸반 실행 상태를 정상으로 판정할 수 없습니다.",
+            "minimum_action": "로컬 JSON 증거의 ERROR 원인을 확인해 주세요.",
+            "follow_up": "원인 해소 후 감시기를 다시 실행해 비어 있지 않은 조회 결과를 확인합니다.",
+        }],
     }
 
 
@@ -450,22 +469,24 @@ def build_remediation_plan(
 
 
 def _human_alerts(findings: list[dict[str, object]]) -> list[dict[str, str]]:
-    alerts: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for finding in findings:
-        if not bool(finding.get("human_only")):
-            continue
-        task_id = str(finding["task_id"])
-        if task_id in seen:
-            continue
-        seen.add(task_id)
-        alerts.append({
-            "cause": f"{task_id}: {finding.get('detail', '사람 확인이 필요한 막힘')}",
-            "impact": "담당 프로필의 후속 진행이 중단될 수 있습니다.",
-            "minimum_action": f"칸반 카드 {task_id}의 요청에 답변해 주세요.",
-            "follow_up": "답변 후 공식 kanban unblock/재배정 경로로 다음 단계를 진행합니다.",
-        })
-    return alerts
+    human_findings = [item for item in findings if bool(item.get("human_only"))]
+    if not human_findings:
+        return []
+    causes = [
+        f"{item['task_id']}: {item.get('detail', '사람 확인이 필요한 막힘')}"
+        for item in human_findings
+    ]
+    first_task_id = str(human_findings[0]["task_id"])
+    remaining = len(human_findings) - 1
+    follow_up = "답변 후 공식 kanban unblock/재배정 경로로 다음 단계를 진행합니다."
+    if remaining:
+        follow_up += f" 재검사에서 나머지 {remaining}건의 해소 여부도 확인합니다."
+    return [{
+        "cause": "; ".join(causes),
+        "impact": "담당 프로필의 후속 진행이 중단될 수 있습니다.",
+        "minimum_action": f"칸반 카드 {first_task_id}의 요청에 답변해 주세요.",
+        "follow_up": follow_up,
+    }]
 
 
 def append_evidence(path: Path, record: dict[str, object]) -> None:
@@ -474,14 +495,73 @@ def append_evidence(path: Path, record: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.parent.is_symlink():
         raise ValueError("증거 디렉터리는 심볼릭 링크일 수 없습니다")
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    data = (payload + "\n").encode("utf-8")
+    if len(data) > MAX_EVIDENCE_RECORD_BYTES:
+        raise ValueError("증거 레코드가 크기 상한을 초과했습니다")
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
     try:
+        deadline = time.monotonic() + EVIDENCE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("증거 파일 잠금 시간이 초과되었습니다")
+                time.sleep(0.01)
+        # Timestamp assignment belongs inside the append lock: concurrent
+        # producers must leave independently identifiable evidence records.
+        end = os.lseek(fd, 0, os.SEEK_END)
+        position = end
+        chunks: list[bytes] = []
+        previous_line = b""
+        while position > 0:
+            size = min(8192, position)
+            position -= size
+            os.lseek(fd, position, os.SEEK_SET)
+            chunks.insert(0, os.read(fd, size))
+            tail = b"".join(chunks).rstrip(b"\n")
+            if len(tail) > MAX_EVIDENCE_RECORD_BYTES:
+                raise ValueError("이전 증거 레코드가 크기 상한을 초과했습니다")
+            newline = tail.rfind(b"\n")
+            if newline >= 0 or position == 0:
+                previous_line = tail[newline + 1:]
+                break
+        if previous_line:
+            try:
+                previous = json.loads(previous_line)
+                previous_at = datetime.fromisoformat(str(previous["timestamp"]))
+                current_at = datetime.fromisoformat(str(record["timestamp"]))
+                if current_at <= previous_at:
+                    record["timestamp"] = (previous_at + timedelta(microseconds=1)).isoformat()
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
         payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        os.write(fd, (payload + "\n").encode("utf-8"))
+        data = (payload + "\n").encode("utf-8")
+        if len(data) > MAX_EVIDENCE_RECORD_BYTES:
+            raise ValueError("증거 레코드가 크기 상한을 초과했습니다")
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError("증거 레코드를 단일 append로 완전히 기록하지 못했습니다")
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def format_human_notifications(record: dict[str, object]) -> str:
+    """Render only actionable Korean fields; empty output suppresses delivery."""
+    alerts = record.get("external_alerts") or []
+    sections = []
+    for alert in alerts:
+        sections.append("\n".join((
+            f"원인: {alert['cause']}",
+            f"영향: {alert['impact']}",
+            f"최소 조치: {alert['minimum_action']}",
+            f"후속 확인: {alert['follow_up']}",
+        )))
+    return "\n\n".join(sections)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -490,12 +570,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE)
     parser.add_argument("--now", type=int)
     parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--notification-mode", choices=("json", "human-only"), default="json"
+    )
     args = parser.parse_args(argv)
 
     now = int(time.time()) if args.now is None else args.now
     try:
         with contextlib.closing(_read_db(args.db, args.timeout)) as conn:
             record = collect_evidence(conn, now=now)
+        if args.now is None:
+            record["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
         append_evidence(args.evidence, record)
     except Exception as exc:
         record = _error_record(now, 0, f"검사를 완료하지 못함: {type(exc).__name__}")
@@ -503,6 +588,11 @@ def main(argv: list[str] | None = None) -> int:
             append_evidence(args.evidence, record)
         except Exception:
             pass
+    if args.notification_mode == "human-only":
+        notification = format_human_notifications(record)
+        if notification:
+            print(notification)
+        return 0
     print(json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0 if record["status"] == "PASS" else (1 if record["status"] == "ERROR" else 2)
 

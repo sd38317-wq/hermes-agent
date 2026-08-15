@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import sqlite3
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from scripts.ops import kanban_runtime_watch as watch
@@ -390,6 +395,167 @@ class RuntimeWatchTests(unittest.TestCase):
         evidence_rows = [json.loads(line) for line in self.evidence.read_text().splitlines()]
         self.assertEqual(1, len(evidence_rows))
         self.assertEqual(result["timestamp"], evidence_rows[0]["timestamp"])
+
+    def test_three_concurrent_runs_append_three_complete_distinct_records(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('HEALTHY','ok','dev','running',1800,1800,80,600,1990,NULL)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(80,'HEALTHY','dev','running',600,1800,NULL,1990)"
+            )
+            conn.commit()
+
+        command = [
+            "python3", str(Path(watch.__file__)), "--db", str(self.db),
+            "--evidence", str(self.evidence),
+        ]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            runs = list(pool.map(lambda _: subprocess.run(
+                command, capture_output=True, text=True, check=False,
+            ), range(3)))
+
+        self.assertTrue(all(run.returncode in {0, 2} for run in runs))
+        records = [json.loads(line) for line in self.evidence.read_text().splitlines()]
+        stdout_records = [json.loads(run.stdout) for run in runs]
+        self.assertEqual(3, len(records))
+        self.assertEqual(3, len({record["timestamp"] for record in records}))
+        self.assertEqual(
+            {record["timestamp"] for record in records},
+            {record["timestamp"] for record in stdout_records},
+        )
+        for record in records:
+            self.assertGreater(record["query_count"], 0)
+            self.assertGreater(record["input_row_count"], 0)
+            self.assertEqual(len(record["findings"]), record["finding_count"])
+            self.assertIn("action_count", record)
+            self.assertEqual(
+                {"checked", "alive", "missing", "duplicates", "results"},
+                set(record["pid_reconciliation"]),
+            )
+
+    def test_append_rejects_oversized_record_without_changing_evidence(self):
+        original = b'{"timestamp":"2026-01-01T00:00:00+00:00"}\n'
+        self.evidence.write_bytes(original)
+        record = {
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            "detail": "x" * watch.MAX_EVIDENCE_RECORD_BYTES,
+        }
+
+        with self.assertRaisesRegex(ValueError, "크기 상한"):
+            watch.append_evidence(self.evidence, record)
+
+        self.assertEqual(original, self.evidence.read_bytes())
+
+    def test_append_lock_wait_is_bounded(self):
+        self.evidence.write_text("")
+        locked = threading.Event()
+
+        def hold_lock():
+            with self.evidence.open("r+") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                locked.set()
+                time.sleep(watch.EVIDENCE_LOCK_TIMEOUT_SECONDS + 0.3)
+
+        thread = threading.Thread(target=hold_lock)
+        thread.start()
+        self.assertTrue(locked.wait(timeout=1))
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(TimeoutError, "잠금"):
+                watch.append_evidence(self.evidence, {
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                })
+        finally:
+            thread.join()
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_no_agent_notification_paths_are_end_to_end_silent_or_korean(self):
+        def invoke(task_values):
+            self.evidence.unlink(missing_ok=True)
+            with contextlib.closing(sqlite3.connect(self.db)) as conn:
+                conn.execute("DELETE FROM tasks")
+                conn.execute("DELETE FROM task_runs")
+                conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)", task_values)
+                conn.commit()
+            return subprocess.run(
+                ["python3", str(Path(watch.__file__)),
+                 "--notification-mode", "human-only",
+                 "--db", str(self.db), "--evidence", str(self.evidence),
+                 "--now", "2000"],
+                capture_output=True, text=True, check=False,
+            )
+
+        healthy = invoke(
+            ("READY", "ok", "dev", "ready", 1990, None, None, None, None, None)
+        )
+        self.assertEqual((0, "", ""), (healthy.returncode, healthy.stdout, healthy.stderr))
+        self.assertEqual("PASS", json.loads(self.evidence.read_text())["status"])
+
+        non_human = invoke(
+            ("STALE", "stale", "dev", "ready", 1, None, None, None, None, None)
+        )
+        self.assertEqual((0, "", ""),
+                         (non_human.returncode, non_human.stdout, non_human.stderr))
+        self.assertEqual("FAIL", json.loads(self.evidence.read_text())["status"])
+
+        human = invoke(
+            ("HUMAN", "approval", "plan", "blocked", 1800, None, None, None,
+             None, "needs_input")
+        )
+        self.assertEqual(0, human.returncode)
+        self.assertEqual("", human.stderr)
+        lines = human.stdout.strip().splitlines()
+        self.assertEqual(["원인", "영향", "최소 조치", "후속 확인"],
+                         [line.split(":", 1)[0] for line in lines])
+        self.assertEqual(1, sum(line.startswith("최소 조치:") for line in lines))
+        evidence = json.loads(self.evidence.read_text())
+        self.assertEqual("FAIL", evidence["status"])
+        self.assertEqual(1, len(evidence["external_alerts"]))
+
+    def test_only_canonical_human_block_kinds_create_external_alerts(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ("LEGACY", "legacy", "plan", "blocked", 1, None, None, None, None, None),
+                    ("INPUT", "input", "plan", "blocked", 1, None, None, None, None, "needs_input"),
+                    ("CAP", "capability", "ops", "blocked", 1, None, None, None, None, "capability"),
+                    ("UNKNOWN", "unknown", "ops", "blocked", 1, None, None, None, None, "machine_retry"),
+                ),
+            )
+            conn.commit()
+
+        _, result = self.run_main()
+
+        self.assertEqual(1, len(result["external_alerts"]))
+        alert = result["external_alerts"][0]
+        self.assertIn("LEGACY", alert["cause"])
+        self.assertIn("INPUT", alert["cause"])
+        self.assertIn("CAP", alert["cause"])
+        self.assertNotIn("UNKNOWN", alert["cause"])
+        rendered = watch.format_human_notifications(result)
+        self.assertEqual(1, rendered.count("최소 조치:"))
+
+    def test_notification_mode_surfaces_detector_error_in_korean(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = watch.main([
+                "--notification-mode", "human-only",
+                "--db", str(self.root / "missing.db"),
+                "--evidence", str(self.evidence),
+                "--now", "2000",
+            ])
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            ["원인", "영향", "최소 조치", "후속 확인"],
+            [line.split(":", 1)[0] for line in output.getvalue().strip().splitlines()],
+        )
+        evidence = json.loads(self.evidence.read_text())
+        self.assertEqual("ERROR", evidence["status"])
 
     def test_remediation_plan_uses_only_official_tool_calls(self):
         plan = watch.build_remediation_plan([
