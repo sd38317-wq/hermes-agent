@@ -140,7 +140,9 @@ def collect_evidence(
         selected = {str(row["id"]) for row in tasks}
         for event in conn.execute(
             "SELECT * FROM task_events "
-            "WHERE kind IN ('created','promoted','unblocked','status','reclaimed') "
+            "WHERE kind IN ("
+            "'created','promoted','unblocked','status','reclaimed','changes_requested'"
+            ") "
             "ORDER BY created_at, id"
         ).fetchall():
             task_id = str(event["task_id"])
@@ -148,7 +150,7 @@ def collect_evidence(
                 continue
             kind = str(event["kind"] or "")
             enters_ready = kind in {"promoted", "unblocked"}
-            if kind == "status" and "payload" in event_columns:
+            if kind in {"status", "changes_requested"} and "payload" in event_columns:
                 try:
                     payload = json.loads(event["payload"] or "{}")
                 except (TypeError, ValueError):
