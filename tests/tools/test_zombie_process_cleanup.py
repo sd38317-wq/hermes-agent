@@ -472,7 +472,9 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # Production enforces a 30s minimum. Keep the test fast while allowing
+        # enough scheduler slack for the daemon worker to start under CI load.
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2.0)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(

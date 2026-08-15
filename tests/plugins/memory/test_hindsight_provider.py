@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -653,21 +654,29 @@ class TestPrefetchServerRetainVisibility:
     def test_prefetch_waits_for_server_completion_before_recall(self, provider):
         """Recall must not run until the tracked async op reports completed."""
         order = []
+        recall_finished = threading.Event()
 
         async def _recall(**kwargs):
             order.append("recall")
+            recall_finished.set()
             return SimpleNamespace(results=[SimpleNamespace(text="m")])
 
         provider._client = self._client_with_ops(["pending", "pending", "completed"])
         provider._client.arecall = AsyncMock(side_effect=_recall)
+        # This test verifies ordering, not the production 0.5s poll cadence.
+        # Removing the sleeps keeps the synchronization event-driven under a
+        # heavily loaded CI runner.
+        provider._RETAIN_OP_POLL_INTERVAL_S = 0
 
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
         assert "op-1" in provider._pending_retain_ops
 
         provider.queue_prefetch("next turn query")
-        if provider._prefetch_thread:
-            provider._prefetch_thread.join(timeout=5.0)
+        assert recall_finished.wait(timeout=5.0), "prefetch did not reach recall"
+        assert provider._prefetch_thread is not None
+        provider._prefetch_thread.join(timeout=5.0)
+        assert not provider._prefetch_thread.is_alive()
 
         # Recall ran, the op was polled to completion, and the pending set
         # was cleared (so a later prefetch won't re-poll it).
