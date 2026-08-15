@@ -342,6 +342,8 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.skipped_priority_locked,
+            result.skipped_priority_checkpoint,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -1429,6 +1431,18 @@ CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Explicit operator designation of the next task for one worker profile.
+-- This is deliberately separate from the numeric priority tiebreaker: an
+-- automated card can choose any numeric priority, but it cannot silently
+-- replace a representative's designation. A terminal target is retained for
+-- audit history but is ignored by the dispatcher, which releases the queue.
+CREATE TABLE IF NOT EXISTS dispatch_priority_locks (
+    assignee       TEXT PRIMARY KEY,
+    task_id        TEXT NOT NULL UNIQUE,
+    designated_by TEXT NOT NULL,
+    designated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -3686,7 +3700,14 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    release_priority_lock: bool = False,
+    release_reason: Optional[str] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3703,6 +3724,34 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
+            )
+        priority_lock = conn.execute(
+            "SELECT assignee FROM dispatch_priority_locks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        active_priority_lock = (
+            priority_lock is not None
+            and row["status"] not in {"done", "archived"}
+            and row["assignee"] != profile
+        )
+        if active_priority_lock and not release_priority_lock:
+            raise RuntimeError(
+                f"cannot reassign {task_id}: representative priority lock is active. "
+                "Explicitly designate a replacement task first."
+            )
+        if active_priority_lock:
+            conn.execute(
+                "DELETE FROM dispatch_priority_locks WHERE task_id = ?",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "priority_lock_released",
+                {
+                    "assignee": row["assignee"],
+                    "reason": release_reason or "explicit reassign recovery",
+                },
             )
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
@@ -4601,6 +4650,146 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def set_dispatch_priority_lock(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    designated_by: str,
+) -> sqlite3.Row:
+    """Explicitly designate *task_id* as its profile's next dispatch target.
+
+    The designation is per assignee so independent profiles can continue in
+    parallel. Re-designation replaces only that profile's prior lock. It never
+    interrupts a running worker; the claim boundary keeps the new target queued
+    until the current same-profile run reaches a terminal checkpoint.
+    """
+    actor = str(designated_by or "").strip()
+    if not actor:
+        raise ValueError("designated_by is required for a priority lock")
+    now = int(time.time())
+    with write_txn(conn):
+        target = conn.execute(
+            "SELECT id, assignee, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if target is None:
+            raise ValueError(f"task not found: {task_id}")
+        assignee = str(target["assignee"] or "").strip()
+        if not assignee:
+            raise ValueError("priority lock target must have an assignee")
+        if target["status"] in {"done", "archived"}:
+            raise ValueError(
+                "priority lock target must be nonterminal "
+                f"(got {target['status']})"
+            )
+        previous = conn.execute(
+            "SELECT task_id FROM dispatch_priority_locks WHERE assignee = ?",
+            (assignee,),
+        ).fetchone()
+        previous_task_id = previous["task_id"] if previous else None
+        conn.execute(
+            "DELETE FROM dispatch_priority_locks WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO dispatch_priority_locks (
+                assignee, task_id, designated_by, designated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(assignee) DO UPDATE SET
+                task_id = excluded.task_id,
+                designated_by = excluded.designated_by,
+                designated_at = excluded.designated_at
+            """,
+            (assignee, task_id, actor, now),
+        )
+        if previous_task_id and previous_task_id != task_id:
+            _append_event(
+                conn,
+                previous_task_id,
+                "priority_lock_replaced",
+                {
+                    "assignee": assignee,
+                    "replacement_task_id": task_id,
+                    "designated_by": actor,
+                },
+            )
+        _append_event(
+            conn,
+            task_id,
+            "priority_lock_designated",
+            {
+                "assignee": assignee,
+                "previous_task_id": previous_task_id,
+                "designated_by": actor,
+            },
+        )
+        row = conn.execute(
+            "SELECT * FROM dispatch_priority_locks WHERE assignee = ?",
+            (assignee,),
+        ).fetchone()
+    return row
+
+
+def active_dispatch_priority_locks(conn: sqlite3.Connection) -> dict[str, str]:
+    """Return active ``assignee -> task_id`` representative designations."""
+    return {
+        str(row["assignee"]): str(row["task_id"])
+        for row in conn.execute(
+            """
+            SELECT l.assignee, l.task_id
+              FROM dispatch_priority_locks l
+              JOIN tasks t ON t.id = l.task_id AND t.assignee = l.assignee
+             WHERE t.status NOT IN ('done', 'archived')
+            """
+        )
+    }
+
+
+def _blocking_dispatch_priority_lock(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return the active designated task blocking *task_id*, if any."""
+    row = conn.execute(
+        """
+        SELECT l.task_id
+          FROM tasks candidate
+          JOIN dispatch_priority_locks l ON l.assignee = candidate.assignee
+          JOIN tasks target ON target.id = l.task_id
+                           AND target.assignee = l.assignee
+         WHERE candidate.id = ?
+           AND l.task_id != candidate.id
+           AND target.status NOT IN ('done', 'archived')
+        """,
+        (task_id,),
+    ).fetchone()
+    return str(row["task_id"]) if row else None
+
+
+def _priority_lock_checkpoint_blocker(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return an older same-profile run delaying a newly designated task."""
+    row = conn.execute(
+        """
+        SELECT running.id
+          FROM tasks candidate
+          JOIN dispatch_priority_locks l ON l.task_id = candidate.id
+                                        AND l.assignee = candidate.assignee
+          JOIN tasks running ON running.assignee = candidate.assignee
+                            AND running.status = 'running'
+                            AND running.id != candidate.id
+         WHERE candidate.id = ?
+         ORDER BY running.started_at ASC, running.created_at ASC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4617,6 +4806,30 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        designated_task_id = _blocking_dispatch_priority_lock(conn, task_id)
+        if designated_task_id:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "priority_locked",
+                    "designated_task_id": designated_task_id,
+                },
+            )
+            return None
+        checkpoint_task_id = _priority_lock_checkpoint_blocker(conn, task_id)
+        if checkpoint_task_id:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "priority_checkpoint",
+                    "running_task_id": checkpoint_task_id,
+                },
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4745,6 +4958,32 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        designated_task_id = _blocking_dispatch_priority_lock(conn, task_id)
+        if designated_task_id:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "priority_locked",
+                    "designated_task_id": designated_task_id,
+                    "source_status": "review",
+                },
+            )
+            return None
+        checkpoint_task_id = _priority_lock_checkpoint_blocker(conn, task_id)
+        if checkpoint_task_id:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "priority_checkpoint",
+                    "running_task_id": checkpoint_task_id,
+                    "source_status": "review",
+                },
+            )
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -5193,7 +5432,13 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(
+            conn,
+            task_id,
+            profile,
+            release_priority_lock=reclaim_first,
+            release_reason=reason,
+        )
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -7464,6 +7709,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM dispatch_priority_locks WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -7487,6 +7733,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM dispatch_priority_locks WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -7952,6 +8199,14 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_priority_locked: list[tuple[str, str, str]] = field(default_factory=list)
+    """Ready tasks deferred by a representative designation, as
+    ``(task_id, assignee, designated_task_id)``. This is expected queue state:
+    only an explicit re-designation or the designated task reaching a terminal
+    checkpoint releases these tasks."""
+    skipped_priority_checkpoint: list[tuple[str, str, str]] = field(default_factory=list)
+    """Newly designated tasks deferred until an older same-profile run reaches
+    a terminal checkpoint, as ``(task_id, assignee, running_task_id)``."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9759,6 +10014,7 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    _priority_locks = active_dispatch_priority_locks(conn)
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -9806,6 +10062,18 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        designated_task_id = _priority_locks.get(row_assignee)
+        if designated_task_id and designated_task_id != row["id"]:
+            result.skipped_priority_locked.append(
+                (row["id"], row_assignee, designated_task_id)
+            )
+            continue
+        checkpoint_task_id = _priority_lock_checkpoint_blocker(conn, row["id"])
+        if checkpoint_task_id:
+            result.skipped_priority_checkpoint.append(
+                (row["id"], row_assignee, checkpoint_task_id)
+            )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -9993,6 +10261,18 @@ def _dispatch_once_locked(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        designated_task_id = _priority_locks.get(row["assignee"])
+        if designated_task_id and designated_task_id != row["id"]:
+            result.skipped_priority_locked.append(
+                (row["id"], row["assignee"], designated_task_id)
+            )
+            continue
+        checkpoint_task_id = _priority_lock_checkpoint_blocker(conn, row["id"])
+        if checkpoint_task_id:
+            result.skipped_priority_checkpoint.append(
+                (row["id"], row["assignee"], checkpoint_task_id)
+            )
             continue
         try:
             from hermes_cli.profiles import profile_exists

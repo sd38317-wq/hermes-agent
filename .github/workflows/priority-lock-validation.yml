@@ -1,0 +1,17 @@
+name: Priority Lock Full Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: priority-lock-full-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  full-suite:
+    uses: ./.github/workflows/tests.yml
+    with:
+      slice_count: 8

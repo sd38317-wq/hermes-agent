@@ -478,6 +478,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
+    # --- explicit representative priority designation ---
+    p_priority_lock = sub.add_parser(
+        "priority-lock",
+        help="Designate one profile's next task without numeric-priority preemption",
+    )
+    p_priority_lock.add_argument("task_id")
+    p_priority_lock.add_argument("--json", action="store_true")
+
     # --- set-model (per-task model/provider override) ---
     p_set_model = sub.add_parser(
         "set-model",
@@ -1113,6 +1121,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "priority-lock": _cmd_priority_lock,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
@@ -1185,6 +1194,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "create",
     "swarm",
     "assign",
+    "priority-lock",
     "reclaim",
     "reassign",
     "link",
@@ -1866,6 +1876,32 @@ def _cmd_assign(args: argparse.Namespace) -> int:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+    return 0
+
+
+def _cmd_priority_lock(args: argparse.Namespace) -> int:
+    from .profiles import get_active_profile_name
+
+    designated_by = get_active_profile_name() or "default"
+    try:
+        with kb.connect_closing() as conn:
+            lock = kb.set_dispatch_priority_lock(
+                conn,
+                args.task_id,
+                designated_by=designated_by,
+            )
+    except ValueError as exc:
+        print(f"kanban priority-lock: {exc}", file=sys.stderr)
+        return 2
+    payload = dict(lock)
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(
+            "Priority lock designated: "
+            f"{payload['assignee']} -> {payload['task_id']} "
+            f"(by {payload['designated_by']})"
+        )
     return 0
 
 
@@ -2682,6 +2718,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_priority_locked": [
+                {"task_id": tid, "assignee": who, "designated_task_id": target}
+                for (tid, who, target) in res.skipped_priority_locked
+            ],
+            "skipped_priority_checkpoint": [
+                {"task_id": tid, "assignee": who, "running_task_id": running}
+                for (tid, who, running) in res.skipped_priority_checkpoint
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2715,6 +2759,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.skipped_priority_locked:
+        for tid, who, target in res.skipped_priority_locked:
+            print(f"Deferred ({who} priority-locked to {target}): {tid}")
+    if res.skipped_priority_checkpoint:
+        for tid, who, running in res.skipped_priority_checkpoint:
+            print(f"Deferred ({who} waiting for {running} checkpoint): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
