@@ -2492,7 +2492,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _slack_ignored_channels(self) -> set[str]:
         """Configured Slack channels the generic gateway must never touch."""
-        raw = self.config.extra.get("ignored_channels")
+        raw = self._slack_behavior_config("ignored_channels")
         if raw is None:
             raw = os.getenv("SLACK_IGNORED_CHANNELS")
         if raw is None:
@@ -8749,6 +8749,68 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ── Channel mention gating ─────────────────────────────────────────────
 
+    def _slack_behavior_config(self, key: str) -> Any:
+        """Return a live Slack behavioral setting, or the startup fallback.
+
+        Behavioral routing settings may be edited while the gateway is
+        running. Read them from the profile-aware, mtime-cached config on each
+        decision. Startup ``PlatformConfig.extra`` is only a compatibility
+        fallback when neither nested Slack section exists.
+        """
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        startup_value = extra.get(key)
+        try:
+            from hermes_cli.config import get_config_path, load_config_readonly
+
+            cache_key = (get_config_path(), key)
+            config = load_config_readonly()
+
+            def _section(root: Any, *path: str) -> Any:
+                current = root
+                for part in path:
+                    if not isinstance(current, dict):
+                        return None
+                    current = current.get(part)
+                return current
+
+            sections = (
+                _section(config, "platforms", "slack"),
+                _section(config, "gateway", "platforms", "slack"),
+            )
+            nested_section_exists = False
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                nested_section_exists = True
+                if key in section:
+                    value = section[key]
+                    break
+                extra = section.get("extra")
+                if isinstance(extra, dict) and key in extra:
+                    value = extra[key]
+                    break
+            else:
+                value = None if nested_section_exists else startup_value
+
+            cache = getattr(self, "_slack_behavior_config_cache", None)
+            if cache is None:
+                cache = {}
+                self._slack_behavior_config_cache = cache
+            cache[cache_key] = value
+            return value
+
+        except Exception:
+            # Transient config read failures must not break message routing.
+            try:
+                cache_key = (get_config_path(), key)
+            except Exception:
+                return startup_value
+            cache = getattr(self, "_slack_behavior_config_cache", None)
+            if cache is not None and cache_key in cache:
+                return cache[cache_key]
+
+        return startup_value
+
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.
 
@@ -8756,7 +8818,7 @@ class SlackAdapter(BasePlatformAdapter):
         truthy parsing, since the safe default is True (gating on).
         Unrecognised or empty values keep gating enabled.
         """
-        configured = self.config.extra.get("require_mention")
+        configured = self._slack_behavior_config("require_mention")
         if configured is not None:
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
@@ -8862,7 +8924,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""
-        raw = self.config.extra.get("free_response_channels")
+        raw = self._slack_behavior_config("free_response_channels")
         if raw is None:
             raw = os.getenv("SLACK_FREE_RESPONSE_CHANNELS", "")
         if isinstance(raw, list):
@@ -8900,7 +8962,7 @@ class SlackAdapter(BasePlatformAdapter):
         by ``_slack_disable_dms()``. Empty set means no channel restriction
         (fully backward compatible).
         """
-        raw = self.config.extra.get("allowed_channels")
+        raw = self._slack_behavior_config("allowed_channels")
         if raw is None:
             raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
         if isinstance(raw, list):
@@ -8919,7 +8981,7 @@ class SlackAdapter(BasePlatformAdapter):
         of the wake checks in :meth:`_should_wake_on_unmentioned_message`.
         Empty set means no per-channel force-mention override (#13855).
         """
-        raw = self.config.extra.get("require_mention_channels")
+        raw = self._slack_behavior_config("require_mention_channels")
         if raw is None:
             raw = os.getenv("SLACK_REQUIRE_MENTION_CHANNELS", "")
         if isinstance(raw, list):

@@ -7,6 +7,7 @@ Follows the same pattern as test_whatsapp_group_gating.py.
 import sys
 import inspect
 import logging
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -134,6 +135,124 @@ def test_free_response_channels_bare_int():
     adapter = _make_adapter(free_response_channels=1491973769726791812)
     result = adapter._slack_free_response_channels()
     assert result == {"1491973769726791812"}
+
+
+@pytest.mark.asyncio
+async def test_constructed_adapter_observes_free_response_channel_config_edit(
+    monkeypatch, tmp_path
+):
+    from gateway.config import load_gateway_config
+    from hermes_cli.config import load_config_readonly
+
+    real_load_config_readonly = load_config_readonly
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "platforms:\n"
+        "  slack:\n"
+        "    require_mention: false\n"
+        "    free_response_channels: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
+
+    startup_config = load_gateway_config().platforms[Platform.SLACK]
+    adapter = SlackAdapter(startup_config)
+    adapter._bot_user_id = BOT_USER_ID
+    assert adapter._slack_require_mention() is False
+    assert adapter._slack_free_response_channels() == set()
+    load_config_readonly()  # Prime the real mtime-keyed behavioral cache.
+
+    config_path.write_text(
+        "platforms:\n"
+        "  slack:\n"
+        "    require_mention: true\n"
+        "    free_response_channels:\n"
+        f"      - {CHANNEL_ID}\n",
+        encoding="utf-8",
+    )
+    stat = config_path.stat()
+    os.utime(config_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    live_config = load_config_readonly()
+    assert CHANNEL_ID in live_config["platforms"]["slack"]["free_response_channels"]
+    assert adapter._slack_require_mention() is True
+    assert CHANNEL_ID in adapter._slack_free_response_channels()
+
+    adapter._dedup = MagicMock(is_duplicate=MagicMock(return_value=False))
+    adapter._lookup_assistant_thread_metadata = MagicMock(return_value={})
+    adapter._channel_team = {}
+    adapter._CHANNEL_TEAM_MAX = 10000
+    adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+    adapter._resolve_user_name = AsyncMock(return_value="testuser")
+    adapter.handle_message = AsyncMock()
+
+    event = {
+        "channel": OTHER_CHANNEL_ID,
+        "channel_type": "channel",
+        "ts": "1710000000.000100",
+        "team": "T1",
+        "user": "U_USER",
+        "client_msg_id": "cmid-dynamic-other",
+        "text": "hello",
+    }
+    await adapter._handle_slack_message(event)
+    adapter.handle_message.assert_not_awaited()
+
+    event.update(
+        channel=CHANNEL_ID,
+        ts="1710000000.000200",
+        client_msg_id="cmid-dynamic-free",
+    )
+    await adapter._handle_slack_message(event)
+    adapter.handle_message.assert_awaited_once()
+
+    def _raise_oserror():
+        raise OSError("transient config read failure")
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _raise_oserror)
+    assert adapter._slack_require_mention() is True
+    assert adapter._slack_free_response_channels() == {CHANNEL_ID}
+
+    second_home = tmp_path / "second-profile"
+    second_home.mkdir()
+    (second_home / "config.yaml").write_text(
+        "platforms:\n"
+        "  slack:\n"
+        "    require_mention: false\n"
+        "    free_response_channels: []\n"
+        "gateway:\n"
+        "  platforms:\n"
+        "    slack:\n"
+        "      require_mention: true\n"
+        "      free_response_channels:\n"
+        f"        - {CHANNEL_ID}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", real_load_config_readonly
+    )
+    assert adapter._slack_require_mention() is False
+    assert adapter._slack_free_response_channels() == set()
+
+    monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
+    second_config_path = second_home / "config.yaml"
+    second_config_path.write_text(
+        "platforms:\n"
+        "  slack: {}\n",
+        encoding="utf-8",
+    )
+    stat = second_config_path.stat()
+    os.utime(
+        second_config_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000)
+    )
+    assert adapter._slack_require_mention() is True
+    assert adapter._slack_free_response_channels() == set()
 
 
 # ---------------------------------------------------------------------------
