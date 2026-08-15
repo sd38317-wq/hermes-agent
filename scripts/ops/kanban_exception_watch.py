@@ -62,7 +62,7 @@ def _pid_alive(pid: object) -> bool:
         value = int(pid)  # type: ignore[arg-type]
         if value <= 0:
             return False
-        os.kill(value, 0)
+        os.kill(value, 0)  # windows-footgun: ok - POSIX-only watcher
         return True
     except (TypeError, ValueError, ProcessLookupError):
         return False
@@ -394,7 +394,7 @@ def advisory_lock(path: Path):
     _reject_symlink(path, "잠금")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    fh = os.fdopen(fd, "a+")
+    fh = os.fdopen(fd, "a+", encoding="utf-8")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield

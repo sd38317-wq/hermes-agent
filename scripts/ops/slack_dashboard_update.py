@@ -85,7 +85,7 @@ def _structured_evidence(raw: object) -> set[str]:
 def _token_from_env_file(path: Path) -> str | None:
     """Read only SLACK_BOT_TOKEN from a securely owned dotenv-style file."""
     before = os.lstat(path)
-    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()  # windows-footgun: ok - POSIX-only
             or stat.S_IMODE(before.st_mode) != 0o600):
         raise PermissionError("unsafe env file")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -93,7 +93,7 @@ def _token_from_env_file(path: Path) -> str | None:
     try:
         after = os.fstat(fd)
         if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-                or not stat.S_ISREG(after.st_mode) or after.st_uid != os.geteuid()
+                or not stat.S_ISREG(after.st_mode) or after.st_uid != os.geteuid()  # windows-footgun: ok - POSIX-only
                 or stat.S_IMODE(after.st_mode) != 0o600):
             raise PermissionError("unsafe env file")
         contents = os.read(fd, 1024 * 1024 + 1)
@@ -122,7 +122,7 @@ def _pid_alive(pid: object) -> bool:
         value = int(pid)  # type: ignore[arg-type]
         if value <= 0:
             return False
-        os.kill(value, 0)
+        os.kill(value, 0)  # windows-footgun: ok - POSIX-only script
         return True
     except (TypeError, ValueError, ProcessLookupError):
         return False
