@@ -321,6 +321,29 @@ def test_assignment_cannot_silently_clear_representative_designation(
         assert kb.active_dispatch_priority_locks(conn) == {"dev": designated}
 
 
+def test_cli_assign_reports_priority_lock_conflict_without_traceback(
+    isolated_kanban_home_with_profiles,
+    capsys,
+):
+    kb = isolated_kanban_home_with_profiles
+    from hermes_cli import kanban as kb_cli
+
+    with kb.connect_closing() as conn:
+        designated = kb.create_task(conn, title="locked", assignee="dev")
+        kb.set_dispatch_priority_lock(
+            conn, designated, designated_by="representative"
+        )
+
+    rc = getattr(kb_cli, "_cmd_assign")(
+        Namespace(task_id=designated, profile="research")
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "representative priority lock is active" in captured.err
+
+
 def test_explicit_reclaim_and_reassign_releases_stuck_designation(
     isolated_kanban_home_with_profiles,
 ):
