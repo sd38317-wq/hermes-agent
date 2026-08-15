@@ -10,7 +10,7 @@ Verifies that:
 """
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 from run_agent import AIAgent
@@ -463,7 +463,9 @@ class TestTryRecoverPrimaryTransport:
                 error, retry_count=3, max_retries=3,
             )
             # wait_time = min(3 + retry_count, 8) = min(6, 8) = 6
-            mock_sleep.assert_called_once_with(6)
+            # Client retirement may also perform short cooperative sleeps;
+            # assert the recovery backoff contract without coupling to those.
+            assert mock_sleep.call_args_list.count(call(6)) == 1
 
     def test_wait_time_capped_at_8(self):
         agent = _make_agent(provider="custom")
@@ -475,7 +477,7 @@ class TestTryRecoverPrimaryTransport:
                 error, retry_count=10, max_retries=3,
             )
             # wait_time = min(3 + 10, 8) = 8
-            mock_sleep.assert_called_once_with(8)
+            assert mock_sleep.call_args_list.count(call(8)) == 1
 
 
     def test_survives_rebuild_failure(self):

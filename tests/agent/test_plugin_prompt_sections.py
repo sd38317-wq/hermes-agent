@@ -137,17 +137,23 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
     )
 
     outputs = []
+    repo_root = os.getcwd()
     for phase in ("first", "resume"):
         env = os.environ.copy()
         env.update(
             HERMES_HOME=str(tmp_path / "hermes-home"),
+            PYTHONPATH=os.pathsep.join(
+                value for value in (repo_root, env.get("PYTHONPATH")) if value
+            ),
             TEST_DB=str(db_path),
             TEST_CALLS=str(calls_path),
             TEST_PHASE=phase,
         )
         proc = subprocess.run(
             [sys.executable, "-c", child],
-            cwd=os.getcwd(),
+            # Keep runner-owned transient files (for example atomic duration
+            # cache updates) out of the prompt snapshot under test.
+            cwd=tmp_path,
             env=env,
             text=True,
             capture_output=True,
