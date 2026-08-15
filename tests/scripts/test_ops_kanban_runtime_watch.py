@@ -60,6 +60,18 @@ class RuntimeWatchTests(unittest.TestCase):
             ])
         return code, json.loads(output.getvalue())
 
+    def run_human(self, *, now: int = 2000):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = watch.main([
+                "--notification-mode", "human-only",
+                "--db", str(self.db),
+                "--evidence", str(self.evidence),
+                "--state", str(self.root / "notification-state.json"),
+                "--now", str(now),
+            ])
+        return code, output.getvalue()
+
     def test_zero_input_rows_can_never_pass(self):
         code, result = self.run_main()
 
@@ -396,6 +408,423 @@ class RuntimeWatchTests(unittest.TestCase):
         self.assertEqual(1, len(evidence_rows))
         self.assertEqual(result["timestamp"], evidence_rows[0]["timestamp"])
 
+    def test_34_blocker_fixture_baselines_and_unchanged_second_run_is_silent(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (f"CARD-{index}", f"승인 요청 {index}", "plan", "blocked", 1800,
+                     None, None, None, None, "needs_input")
+                    for index in range(34)
+                ],
+            )
+            conn.commit()
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(
+                34,
+                conn.execute("SELECT count(*) FROM tasks WHERE status='blocked'").fetchone()[0],
+            )
+        self.assertEqual((0, ""), self.run_human())
+        self.assertEqual((0, ""), self.run_human(now=2001))
+
+    def test_reason_action_fingerprint_ignores_title_and_alerts_on_event_reason_change(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('SECRET-ID','배포 승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES "
+                "(1,'SECRET-ID','blocked',?,1900)",
+                (json.dumps({"reason": "고객 승인 대기. 최소 조치: 승인 여부를 알려 주세요."}),),
+            )
+            conn.commit()
+
+        self.assertEqual("", self.run_human()[1])
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET title='긴급 배포 승인' WHERE id='SECRET-ID'")
+            conn.commit()
+        self.assertEqual("", self.run_human(now=2001)[1])
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO task_events VALUES "
+                "(2,'SECRET-ID','block_loop_detected',?,2002)",
+                (json.dumps({"reason": "법무 승인 대기. 필요한 조치: 승인 담당자를 지정해 주세요."}),),
+            )
+            conn.commit()
+
+        changed = self.run_human(now=2002)[1]
+        self.assertIn("원인: 법무 승인 대기.", changed)
+        self.assertIn("최소 조치: 승인 담당자를 지정해 주세요.", changed)
+        self.assertNotIn("SECRET-ID", changed)
+        self.assertEqual("", self.run_human(now=2003)[1])
+
+    def test_newer_run_summary_overrides_older_block_event_reason(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE task_runs ADD COLUMN summary TEXT")
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('LATEST','배포 승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (1,'LATEST','blocked',?,1900)",
+                (json.dumps({"reason": "기존 승인 대기. 최소 조치: 기존 답변을 알려 주세요."}),),
+            )
+            conn.commit()
+        self.assertEqual("", self.run_human()[1])
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(1,'LATEST','plan','blocked',NULL,1990,2001,NULL,"
+                "'보안 승인 대기. 최소 조치: 보안 책임자의 답변을 알려 주세요.')"
+            )
+            conn.commit()
+
+        rendered = self.run_human(now=2002)[1]
+        self.assertIn("보안 승인 대기", rendered)
+        self.assertIn("보안 책임자의 답변을 알려 주세요.", rendered)
+
+    def test_internal_identifier_only_change_is_sanitized_and_not_realerted(self):
+        task_id = "X7-INTERNAL"
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "(?, '접근 승인', 'plan', 'blocked', 1800, NULL, NULL, NULL, NULL, "
+                "'needs_input')",
+                (task_id,),
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (1,?,'blocked',?,1900)",
+                (task_id, json.dumps({
+                    "reason": f"접근 승인이 없습니다. 최소 조치: {task_id} 승인 여부를 알려 주세요."
+                })),
+            )
+            conn.commit()
+        self.assertEqual("", self.run_human()[1])
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO task_events VALUES (2,?,'blocked',?,2001)",
+                (task_id, json.dumps({
+                    "reason": "접근 승인이 없습니다. 최소 조치: X8-INTERNAL 승인 여부를 알려 주세요."
+                })),
+            )
+            conn.commit()
+
+        self.assertEqual("", self.run_human(now=2002)[1])
+
+    def test_block_loop_triage_uses_latest_canonical_event_reason(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('LOOP','반복 승인','plan','triage',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (1,'LOOP','block_loop_detected',?,1900)",
+                (json.dumps({"reason": "반복 차단 원인. 최소 조치: 최종 결정을 알려 주세요."}),),
+            )
+            conn.commit()
+
+        self.assertEqual("", self.run_human()[1])
+        state = json.loads((self.root / "notification-state.json").read_text())
+        self.assertEqual(1, len(state["active"]))
+
+    def test_run_summary_change_alerts_and_resolution_recurrence_alerts_once(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE task_runs ADD COLUMN summary TEXT")
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('RECURRENCE','승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.execute(
+                "INSERT INTO task_runs VALUES "
+                "(1,'RECURRENCE','plan','done',NULL,1800,1900,NULL,"
+                "'보안 승인 대기. 대안 1개: 임시 예외를 승인해 주세요.')"
+            )
+            conn.commit()
+
+        self.assertEqual("", self.run_human()[1])
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "UPDATE task_runs SET summary="
+                "'재무 승인 대기. 최소 조치: 예산을 승인해 주세요.' WHERE id=1"
+            )
+            conn.commit()
+        self.assertIn("재무 승인 대기", self.run_human(now=2001)[1])
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='todo' WHERE id='RECURRENCE'")
+            conn.commit()
+        self.assertEqual("", self.run_human(now=2002)[1])
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id='RECURRENCE'")
+            conn.commit()
+        recurrence = self.run_human(now=2003)[1]
+        self.assertIn("재무 승인 대기", recurrence)
+        self.assertEqual(1, recurrence.count("최소 조치:"))
+        self.assertEqual("", self.run_human(now=2004)[1])
+
+    def test_public_alert_is_plain_korean_without_internal_identifiers_or_terms(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('t_private_123','고객 데이터 반출 승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.commit()
+        conn_reason = "고객 동의가 없습니다. 필요한 조치: 반출 동의를 확인해 주세요."
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO task_events VALUES (1,'t_private_123','blocked',?,1900)",
+                         (json.dumps({"reason": conn_reason}),))
+            conn.commit()
+        self.run_human()
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO task_events VALUES (2,'t_private_123','blocked',?,2001)",
+                (json.dumps({"reason": "보안 정책 승인이 없습니다. 대안 1개: 책임자 승인을 받아 주세요. "
+                                       "task-abc run-77 PID 123 deadbeef"}),),
+            )
+            conn.commit()
+
+        _, rendered = self.run_human(now=2001)
+
+        self.assertEqual(
+            ["제목", "원인", "영향", "최소 조치", "후속 확인"],
+            [line.split(":", 1)[0] for line in rendered.strip().splitlines()],
+        )
+        self.assertEqual(1, rendered.count("최소 조치:"))
+        for forbidden in ("t_private_123", "task", "run", "PID", "deadbeef",
+                          "block_kind", "needs_input", "capability", "blocked"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_selects_one_highest_operational_human_blocker_and_filters_noise(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN operational_impact INTEGER")
+            conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")
+            conn.execute("ALTER TABLE tasks ADD COLUMN urgency INTEGER")
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ("A", "낮은 승인", "plan", "blocked", 1, None, None, None, None,
+                     "needs_input", 1, 9, 9),
+                    ("Z", "서비스 중단 승인", "plan", "blocked", 1, None, None, None, None,
+                     "needs_input", 10, 1, 1),
+                    ("TECH", "기술 검증 완료 확인", "dev", "blocked", 1, None, None, None, None,
+                     "needs_input", 99, 99, 99),
+                    ("BOT", "봇 자동 복구 대기", "dev", "blocked", 1, None, None, None, None,
+                     "capability", 99, 99, 99),
+                    ("DEP", "선행 작업 대기", "dev", "blocked", 1, None, None, None, None,
+                     "dependency", 99, 99, 99),
+                ),
+            )
+            conn.commit()
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for index, task_id in enumerate(("A", "Z"), 1):
+                conn.execute(
+                    "INSERT INTO task_events VALUES (?,?,?,?,?)",
+                    (index, task_id, "blocked", json.dumps({"reason": "승인 대기"}), 100 + index),
+                )
+            conn.commit()
+        self.run_human()
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO task_events VALUES (10,'A','blocked',?,2001)",
+                         (json.dumps({"reason": "낮은 영향 변경. 최소 조치: 답해 주세요."}),))
+            conn.execute("INSERT INTO task_events VALUES (11,'Z','blocked',?,2000)",
+                         (json.dumps({"reason": "서비스 중단 변경. 최소 조치: 승인해 주세요."}),))
+            conn.commit()
+
+        _, rendered = self.run_human(now=2001)
+
+        self.assertIn("서비스 중단 변경", rendered)
+        self.assertNotIn("낮은 영향 변경", rendered)
+        self.assertNotIn("기술 검증", rendered)
+        self.assertNotIn("봇 자동", rendered)
+        self.assertEqual(1, rendered.count("제목:"))
+        deferred = self.run_human(now=2002)[1]
+        self.assertIn("낮은 영향 변경", deferred)
+        self.assertNotIn("서비스 중단 변경", deferred)
+        self.assertEqual("", self.run_human(now=2003)[1])
+
+    def test_ranking_final_tie_uses_created_or_event_recency_not_id_or_title(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN operational_impact INTEGER")
+            conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")
+            conn.execute("ALTER TABLE tasks ADD COLUMN urgency INTEGER")
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (("Z", "가", "plan", "blocked", 100, None, None, None, None,
+                  "needs_input", 1, 1, 1),
+                 ("A", "하", "plan", "blocked", 200, None, None, None, None,
+                  "needs_input", 1, 1, 1)),
+            )
+            conn.commit()
+        self.run_human()
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.executemany(
+                "INSERT INTO task_events VALUES (?,?,?,?,?)",
+                ((1, "Z", "blocked", json.dumps({"reason": "오래된 사유"}), 300),
+                 (2, "A", "blocked", json.dumps({"reason": "최신 사유"}), 400)),
+            )
+            conn.commit()
+        rendered = self.run_human(now=2001)[1]
+        self.assertIn("최신 사유", rendered)
+        self.assertNotIn("오래된 사유", rendered)
+
+    def test_canonical_fields_and_korean_markers_exclude_non_actionable_blocks(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for name in ("actioned_at", "verification_status", "bot_resolving",
+                         "dependency_task_id"):
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT")
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (("ACTIONED", "승인", "plan", "blocked", 1, None, None, None, None,
+                  "needs_input", "yes", None, None, None),
+                 ("VERIFY", "기술 검증 대기", "plan", "blocked", 1, None, None, None, None,
+                  "needs_input", None, "pending", None, None),
+                 ("BOT", "자동 해결 중", "plan", "blocked", 1, None, None, None, None,
+                  "needs_input", None, None, "yes", None),
+                 ("DEP", "승인", "plan", "blocked", 1, None, None, None, None,
+                  "needs_input", None, None, None, "PARENT")),
+            )
+            conn.executemany(
+                "INSERT INTO task_events VALUES (?,?,?,?,?)",
+                ((1, "ACTIONED", "blocked", json.dumps({"reason": "이미 조치됨"}), 10),
+                 (2, "VERIFY", "blocked", json.dumps({"reason": "기술 검증 결과 대기"}), 10),
+                 (3, "BOT", "blocked", json.dumps({"reason": "봇이 자동 복구 중"}), 10),
+                 (4, "DEP", "blocked", json.dumps({"reason": "선행 작업 완료 대기"}), 10)),
+            )
+            conn.commit()
+        self.assertEqual("", self.run_human()[1])
+        state = json.loads((self.root / "notification-state.json").read_text())
+        self.assertEqual({}, state["active"])
+
+    def test_corrupt_prior_state_is_replaced_as_silent_baseline(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('ONE','승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.commit()
+        state = self.root / "notification-state.json"
+        state.write_text("{broken", encoding="utf-8")
+
+        self.assertEqual("", self.run_human()[1])
+        self.assertEqual(1, len(json.loads(state.read_text())["active"]))
+        self.assertEqual("", self.run_human(now=2001)[1])
+
+    def test_state_path_cannot_overwrite_database(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('ONE','승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.commit()
+        before = self.db.read_bytes()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            watch.main([
+                "--notification-mode", "human-only",
+                "--db", str(self.db),
+                "--evidence", str(self.evidence),
+                "--state", str(self.db),
+                "--now", "2000",
+            ])
+
+        self.assertEqual(before, self.db.read_bytes())
+
+    def test_state_path_cannot_overwrite_evidence(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('ONE','승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.commit()
+        original = b'{"timestamp":"2026-01-01T00:00:00+00:00"}\n'
+        self.evidence.write_bytes(original)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            watch.main([
+                "--notification-mode", "human-only",
+                "--db", str(self.db),
+                "--evidence", str(self.evidence),
+                "--state", str(self.evidence),
+                "--now", "2000",
+            ])
+
+        self.assertTrue(self.evidence.read_bytes().startswith(original))
+
+    def test_overlapping_older_snapshot_cannot_overwrite_newer_notification_state(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('RACE','운영 승인','plan','blocked',1800,NULL,NULL,NULL,NULL,'needs_input')"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (1,'RACE','blocked',?,1900)",
+                (json.dumps({"reason": "최초 원인. 최소 조치: 최초 답변을 알려 주세요."}),),
+            )
+            conn.commit()
+        self.assertEqual("", self.run_human()[1])
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO task_events VALUES (2,'RACE','blocked',?,2001)",
+                (json.dumps({"reason": "이전 원인. 최소 조치: 이전 답변을 알려 주세요."}),),
+            )
+            conn.commit()
+
+        older_collected = threading.Event()
+        release_older = threading.Event()
+        newer_finished = threading.Event()
+        original_candidates = watch._notification_candidates
+
+        def delayed_candidates(conn, record):
+            candidates = original_candidates(conn, record)
+            if threading.current_thread().name == "older-snapshot":
+                older_collected.set()
+                self.assertTrue(release_older.wait(timeout=2))
+            return candidates
+
+        def invoke(now):
+            try:
+                watch.main([
+                    "--notification-mode", "human-only",
+                    "--db", str(self.db),
+                    "--evidence", str(self.evidence),
+                    "--state", str(self.root / "notification-state.json"),
+                    "--now", str(now),
+                ])
+            finally:
+                if threading.current_thread().name == "newer-snapshot":
+                    newer_finished.set()
+
+        watch._notification_candidates = delayed_candidates
+        try:
+            older = threading.Thread(target=invoke, args=(2001,), name="older-snapshot")
+            older.start()
+            self.assertTrue(older_collected.wait(timeout=2))
+            with contextlib.closing(sqlite3.connect(self.db)) as conn:
+                conn.execute(
+                    "INSERT INTO task_events VALUES (3,'RACE','blocked',?,2002)",
+                    (json.dumps({"reason": "최신 원인. 최소 조치: 최신 답변을 알려 주세요."}),),
+                )
+                conn.commit()
+            newer = threading.Thread(target=invoke, args=(2002,), name="newer-snapshot")
+            newer.start()
+            newer_finished.wait(timeout=1)
+            release_older.set()
+            older.join(timeout=2)
+            newer.join(timeout=2)
+            self.assertFalse(older.is_alive())
+            self.assertFalse(newer.is_alive())
+        finally:
+            release_older.set()
+            watch._notification_candidates = original_candidates
+
+        self.assertEqual("", self.run_human(now=2003)[1])
+
     def test_three_concurrent_runs_append_three_complete_distinct_records(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute(
@@ -508,7 +937,7 @@ class RuntimeWatchTests(unittest.TestCase):
         self.assertEqual(0, human.returncode)
         self.assertEqual("", human.stderr)
         lines = human.stdout.strip().splitlines()
-        self.assertEqual(["원인", "영향", "최소 조치", "후속 확인"],
+        self.assertEqual(["제목", "원인", "영향", "최소 조치", "후속 확인"],
                          [line.split(":", 1)[0] for line in lines])
         self.assertEqual(1, sum(line.startswith("최소 조치:") for line in lines))
         evidence = json.loads(self.evidence.read_text())
@@ -550,10 +979,13 @@ class RuntimeWatchTests(unittest.TestCase):
             ])
 
         self.assertEqual(0, code)
+        rendered = output.getvalue()
         self.assertEqual(
-            ["원인", "영향", "최소 조치", "후속 확인"],
-            [line.split(":", 1)[0] for line in output.getvalue().strip().splitlines()],
+            ["제목", "원인", "영향", "최소 조치", "후속 확인"],
+            [line.split(":", 1)[0] for line in rendered.strip().splitlines()],
         )
+        for forbidden in ("ERROR", "ValueError", "JSON", "task", "run", "PID"):
+            self.assertNotIn(forbidden, rendered)
         evidence = json.loads(self.evidence.read_text())
         self.assertEqual("ERROR", evidence["status"])
 

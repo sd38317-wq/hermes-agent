@@ -13,7 +13,9 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import sqlite3
+import tempfile
 import time
 from collections import Counter, defaultdict
 from contextvars import ContextVar
@@ -24,7 +26,10 @@ from urllib.parse import quote
 
 DEFAULT_DB = Path("/opt/data/kanban.db")
 DEFAULT_EVIDENCE = Path("/opt/data/cron/evidence/kanban-runtime-watch.jsonl")
-ACTIVE_STATUSES = ("running", "ready", "blocked", "todo")
+DEFAULT_NOTIFICATION_STATE = Path(
+    "/opt/data/cron/evidence/kanban-runtime-watch-notifications.json"
+)
+ACTIVE_STATUSES = ("running", "ready", "blocked", "triage", "todo")
 STALE_SECONDS = 120
 MAX_EVIDENCE_RECORD_BYTES = 1024 * 1024
 EVIDENCE_LOCK_TIMEOUT_SECONDS = 0.5
@@ -316,7 +321,9 @@ def collect_evidence(
 
         raw_block_kind = _value(task, task_columns, "block_kind")
         block_kind = None if raw_block_kind is None else str(raw_block_kind)
-        if status == "blocked" and block_kind in {None, "needs_input", "capability"}:
+        if status in {"blocked", "triage"} and block_kind in {
+            None, "needs_input", "capability"
+        }:
             detail = (
                 "사람만 해소 가능한 legacy 미분류 막힘"
                 if block_kind is None
@@ -441,9 +448,9 @@ def _error_record(now: int, query_count: int, detail: str) -> dict[str, object]:
         "findings": [_finding("insufficient_evidence", "board", detail=detail)],
         "remediation_plan": [],
         "external_alerts": [{
-            "cause": f"감시기가 충분한 증거를 수집하지 못했습니다: {detail}",
+            "cause": "감시기가 이번 점검을 완료하지 못했습니다.",
             "impact": "칸반 실행 상태를 정상으로 판정할 수 없습니다.",
-            "minimum_action": "로컬 JSON 증거의 ERROR 원인을 확인해 주세요.",
+            "minimum_action": "로컬 점검 기록에서 오류 원인을 확인해 주세요.",
             "follow_up": "원인 해소 후 감시기를 다시 실행해 비어 있지 않은 조회 결과를 확인합니다.",
         }],
     }
@@ -556,6 +563,7 @@ def format_human_notifications(record: dict[str, object]) -> str:
     sections = []
     for alert in alerts:
         sections.append("\n".join((
+            f"제목: {alert.get('title') or '칸반 감시기 점검'}",
             f"원인: {alert['cause']}",
             f"영향: {alert['impact']}",
             f"최소 조치: {alert['minimum_action']}",
@@ -564,32 +572,323 @@ def format_human_notifications(record: dict[str, object]) -> str:
     return "\n\n".join(sections)
 
 
+def _notification_candidates(
+    conn: sqlite3.Connection, record: dict[str, object]
+) -> list[dict[str, object]]:
+    """Resolve public-delivery metadata without changing canonical evidence."""
+    human_ids = {
+        str(item["task_id"])
+        for item in record.get("findings", [])  # type: ignore[union-attr]
+        if bool(item.get("human_only"))
+    }
+    columns = _columns(conn, "tasks")
+    event_columns = _columns(conn, "task_events")
+    run_columns = _columns(conn, "task_runs")
+    candidates: list[dict[str, object]] = []
+    for task_id in human_ids:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            continue
+        title = str(_value(row, columns, "title") or "제목 없는 업무").strip()
+        event_reason = ""
+        event_at = 0
+        if {"id", "task_id", "kind", "payload", "created_at"} <= event_columns:
+            event = conn.execute(
+                "SELECT * FROM task_events WHERE task_id=? "
+                "AND kind IN ('blocked','block_loop_detected') "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if event is not None:
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                if isinstance(payload, dict) and isinstance(payload.get("reason"), str):
+                    event_reason = payload["reason"].strip()
+                    event_at = int(event["created_at"] or 0)
+        run_summary = ""
+        run_at = 0
+        if {"task_id", "summary"} <= run_columns:
+            run = conn.execute(
+                "SELECT * FROM task_runs WHERE task_id=? AND summary IS NOT NULL "
+                "AND trim(summary)<>'' "
+                "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if run is not None:
+                run_summary = str(run["summary"]).strip()
+                run_at = int(_value(run, run_columns, "ended_at") or
+                             _value(run, run_columns, "started_at") or 0)
+        kind = str(_value(row, columns, "block_kind") or "legacy")
+        if run_summary and run_at > event_at:
+            reason = run_summary
+            reason_at = run_at
+        elif event_reason:
+            reason = event_reason
+            reason_at = event_at
+        elif run_summary:
+            reason = run_summary
+            reason_at = run_at
+        else:
+            reason = (
+                "진행에 필요한 사람의 결정이나 정보가 아직 제공되지 않았습니다."
+                if kind != "capability"
+                else "진행에 필요한 접근 권한이나 외부 지원이 아직 제공되지 않았습니다."
+            )
+            reason_at = 0
+        cause, action = _split_reason_action(reason, secrets=(task_id,))
+        searchable = f"{title} {reason}".casefold().replace(" ", "")
+        # These are observations or machine-owned waits, not unanswered human gates.
+        excluded = ("기술검증", "검증완료", "확인완료", "이미조치", "조치완료",
+                    "조치됨", "봇자동", "자동해결", "자동복구", "자동처리",
+                    "의존성", "선행작업", "선행업무")
+        if any(term in searchable for term in excluded):
+            continue
+        if kind in {"dependency", "transient", "technical_verification", "bot_resolving"}:
+            continue
+        if any(
+            _value(row, columns, name)
+            for name in ("actioned_at", "resolved_at", "verification_status",
+                         "bot_resolving", "dependency_task_id")
+        ):
+            continue
+        rank = tuple(
+            int(_value(row, columns, name) or 0)
+            for name in ("operational_impact", "priority", "urgency")
+        )
+        fingerprint = json.dumps(
+            {"cause": cause, "minimum_action": action},
+            ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        candidates.append({
+            "key": task_id,
+            "fingerprint": fingerprint,
+            "title": title,
+            "cause": cause,
+            "action": action,
+            "rank": (*rank, reason_at or int(_value(row, columns, "created_at") or 0)),
+        })
+    return candidates
+
+
+_ACTION_PREFIX = re.compile(r"(?:최소\s*조치|필요한\s*조치|대안\s*1개)\s*[:：]\s*")
+_INTERNAL_TOKEN = re.compile(
+    r"(?:\b(?i:task|run|pid|commit|block(?:ed|er|_kind)?|needs_input|capability)"
+    r"(?i:[-_:= ]?[a-z0-9]+)*\b|(?i:\b[0-9a-f]{7,40}\b)|"
+    r"\b[A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)+\b)"
+)
+
+
+def _sanitize_public_text(value: str, *, secrets: tuple[str, ...] = ()) -> str:
+    cleaned = value
+    for secret in secrets:
+        if secret:
+            cleaned = cleaned.replace(secret, "")
+    cleaned = _INTERNAL_TOKEN.sub("", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
+
+
+def _split_reason_action(
+    reason: str, *, secrets: tuple[str, ...] = ()
+) -> tuple[str, str]:
+    match = _ACTION_PREFIX.search(reason)
+    if match:
+        cause = reason[:match.start()].strip()
+        action = reason[match.end():].strip()
+    else:
+        sentences = re.split(r"(?<=[.!?。！？])\s+", reason.strip())
+        action_index = next(
+            (index for index, sentence in enumerate(sentences)
+             if re.search(r"해\s*주세요[.!?。！？]?\s*$", sentence)),
+            None,
+        )
+        if action_index is None:
+            cause, action = reason.strip(), "필요한 결정이나 정보를 한 가지 알려 주세요."
+        else:
+            cause = " ".join(sentences[:action_index]).strip()
+            action = sentences[action_index].strip()
+    cause = _sanitize_public_text(cause, secrets=secrets) or "사람의 결정이나 정보가 필요합니다."
+    action = _sanitize_public_text(action, secrets=secrets)
+    if not action or "주세요" not in action.replace(" ", ""):
+        action = "필요한 결정이나 정보를 한 가지 알려 주세요."
+    return cause, action
+
+
+def _public_notification(candidate: dict[str, object]) -> str:
+    title = _sanitize_public_text(
+        str(candidate["title"]), secrets=(str(candidate["key"]),)
+    ) or "사람 확인이 필요한 업무"
+    cause = str(candidate["cause"])
+    action = str(candidate["action"])
+    return "\n".join((
+        f"제목: {title}",
+        f"원인: {cause}",
+        "영향: 이 업무와 연결된 다음 운영 단계가 시작되지 못합니다.",
+        f"최소 조치: {action}",
+        "후속 확인: 답변이 반영되면 다음 점검에서 진행 재개 여부를 확인합니다.",
+    ))
+
+
+def _candidate_rank(candidate: dict[str, object]) -> tuple[int, ...]:
+    rank = candidate.get("rank")
+    if not isinstance(rank, tuple):
+        return ()
+    return tuple(int(value) for value in rank)
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    if left.resolve(strict=False) == right.resolve(strict=False):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+@contextlib.contextmanager
+def _notification_state_lock(path: Path) -> Iterator[None]:
+    """Serialize the board snapshot and its notification-state transition."""
+    if path.is_symlink():
+        raise ValueError("알림 상태 경로는 심볼릭 링크일 수 없습니다")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise ValueError("알림 상태 디렉터리는 심볼릭 링크일 수 없습니다")
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = os.open(
+        lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(lock_fd)
+
+
+def _update_notification_state(
+    path: Path, candidates: list[dict[str, object]], *, locked: bool = False
+) -> str:
+    """Atomically compare/update active fingerprints and return at most one alert."""
+    if not locked:
+        with _notification_state_lock(path):
+            return _update_notification_state(path, candidates, locked=True)
+    existed = path.is_file()
+    valid_previous = not existed
+    previous: dict[str, str] = {}
+    if existed:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if (isinstance(loaded, dict) and loaded.get("version") == 1
+                    and isinstance(loaded.get("active"), dict)
+                    and all(isinstance(k, str) and isinstance(v, str)
+                            for k, v in loaded["active"].items())):
+                previous = {str(k): str(v) for k, v in loaded["active"].items()}
+                valid_previous = True
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    current = {str(item["key"]): str(item["fingerprint"]) for item in candidates}
+    changed = [
+        item for item in candidates
+        if existed and valid_previous
+        and previous.get(str(item["key"])) != item["fingerprint"]
+    ]
+    selected = max(changed, key=_candidate_rank) if changed else None
+    active: dict[str, str] = {}
+    for item in candidates:
+        key = str(item["key"])
+        fingerprint = current[key]
+        if selected is item or not (existed and valid_previous):
+            active[key] = fingerprint
+        elif previous.get(key) == fingerprint:
+            active[key] = fingerprint
+        elif key in previous:
+            # Keep an unselected change pending for the next tick. New
+            # unselected keys stay absent, which likewise keeps them pending.
+            active[key] = previous[key]
+    payload = json.dumps({"version": 1, "active": active}, ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":"))
+    temp_fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(temp_fd, 0o600)
+        data = payload.encode("utf-8")
+        offset = 0
+        while offset < len(data):
+            written = os.write(temp_fd, data[offset:])
+            if written <= 0:
+                raise OSError("알림 상태를 완전히 기록하지 못했습니다")
+            offset += written
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = -1
+        os.replace(temp_name, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    if selected is None:
+        return ""
+    return _public_notification(selected)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE)
+    parser.add_argument("--state", type=Path)
     parser.add_argument("--now", type=int)
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument(
         "--notification-mode", choices=("json", "human-only"), default="json"
     )
     args = parser.parse_args(argv)
+    state_path = args.state
+    if state_path is None:
+        state_path = (
+            DEFAULT_NOTIFICATION_STATE
+            if args.evidence == DEFAULT_EVIDENCE
+            else args.evidence.with_name(args.evidence.name + ".notifications.json")
+        )
 
     now = int(time.time()) if args.now is None else args.now
+    human_mode = args.notification_mode == "human-only"
+    notification = ""
     try:
-        with contextlib.closing(_read_db(args.db, args.timeout)) as conn:
-            record = collect_evidence(conn, now=now)
-        if args.now is None:
-            record["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
-        append_evidence(args.evidence, record)
+        if human_mode and any(
+            _paths_alias(state_path, persistent)
+            for persistent in (args.db, args.evidence)
+        ):
+            raise ValueError("알림 상태 경로는 데이터베이스나 증거 경로와 달라야 합니다")
+        lock_context = (
+            _notification_state_lock(state_path)
+            if human_mode else contextlib.nullcontext()
+        )
+        with lock_context:
+            with contextlib.closing(_read_db(args.db, args.timeout)) as conn:
+                record = collect_evidence(conn, now=now)
+                candidates = _notification_candidates(conn, record) if human_mode else []
+            if args.now is None:
+                record["timestamp"] = datetime.now(tz=timezone.utc).isoformat()
+            append_evidence(args.evidence, record)
+            if human_mode:
+                notification = _update_notification_state(
+                    state_path, candidates, locked=True
+                )
     except Exception as exc:
         record = _error_record(now, 0, f"검사를 완료하지 못함: {type(exc).__name__}")
         try:
             append_evidence(args.evidence, record)
         except Exception:
             pass
-    if args.notification_mode == "human-only":
-        notification = format_human_notifications(record)
+        if human_mode:
+            notification = format_human_notifications(record)
+    if human_mode:
         if notification:
             print(notification)
         return 0
