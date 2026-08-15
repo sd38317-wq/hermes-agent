@@ -84,6 +84,10 @@ class RuntimeWatchTests(unittest.TestCase):
         self.assertEqual(1, result["input_row_count"])
         self.assertEqual(1, result["pid_reconciliation"]["checked"])
         self.assertEqual(1, result["pid_reconciliation"]["alive"])
+        self.assertEqual(
+            [{"pid": 321, "alive": True, "task_ids": ["t_adf495b7"]}],
+            result["pid_reconciliation"]["results"],
+        )
 
     def test_restore_and_three_hour_cards_are_not_false_ready_findings(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:

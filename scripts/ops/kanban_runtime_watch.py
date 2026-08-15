@@ -312,10 +312,17 @@ def collect_evidence(
                 detail="독립 후속업무에 담당 프로필이 없음",
             ))
 
-    pid_result = {"checked": 0, "alive": 0, "missing": 0, "duplicates": []}
+    pid_result = {
+        "checked": 0, "alive": 0, "missing": 0,
+        "duplicates": [], "results": [],
+    }
     for pid, task_ids in sorted(pid_candidates.items()):
         pid_result["checked"] += 1
-        if _pid_alive(pid):
+        alive = _pid_alive(pid)
+        pid_result["results"].append({
+            "pid": pid, "alive": alive, "task_ids": sorted(task_ids),
+        })
+        if alive:
             pid_result["alive"] += 1
         else:
             pid_result["missing"] += 1
@@ -402,7 +409,8 @@ def _error_record(now: int, query_count: int, detail: str) -> dict[str, object]:
         "finding_count": 1,
         "action_count": 0,
         "pid_reconciliation": {
-            "checked": 0, "alive": 0, "missing": 0, "duplicates": [],
+            "checked": 0, "alive": 0, "missing": 0,
+            "duplicates": [], "results": [],
         },
         "findings": [_finding("insufficient_evidence", "board", detail=detail)],
         "remediation_plan": [],

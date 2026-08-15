@@ -30,7 +30,8 @@ these fields exist:
 - `input_row_count > 0`
 - `finding_count == len(findings)`
 - `action_count == 0` during detection
-- `pid_reconciliation.checked`, `alive`, `missing`, and `duplicates`
+- `pid_reconciliation.checked`, `alive`, `missing`, `duplicates`, and per-PID
+  `results`
 - an ISO-8601 UTC `timestamp`
 
 `PASS` is valid only when the input and query counts are non-zero and no
