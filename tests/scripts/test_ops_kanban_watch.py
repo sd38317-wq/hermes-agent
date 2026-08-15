@@ -651,6 +651,54 @@ class WatcherTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 2)
 
+    def test_unrelated_task_event_does_not_break_coordination_deduplication(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.add_task(conn, "TARGET", "dev", "ready", created_at=1800)
+            self.add_task(conn, "OTHER", "research", "done")
+            conn.commit()
+
+        item = [{"kind": "ready_stale", "task": "TARGET"}]
+        watch.emit_coordination_events(self.db, item, now=2000)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO task_events (task_id,kind,created_at) "
+                "VALUES ('OTHER','completed',2001)"
+            )
+            conn.commit()
+
+        # Simulate a crash before the fingerprint file was replaced.  A board
+        # event for another task is not a relevant TARGET state transition.
+        watch.emit_coordination_events(self.db, item, now=2002)
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE task_id='TARGET' AND kind='coordination_required'"
+            ).fetchone()[0]
+        self.assertEqual(1, count)
+
+    def test_missing_signal_target_rolls_back_all_events(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.add_task(conn, "A-PRESENT", "dev", "ready", created_at=1800)
+            conn.commit()
+
+        with self.assertRaises(RuntimeError):
+            watch.emit_coordination_events(
+                self.db,
+                [
+                    {"kind": "ready_stale", "task": "A-PRESENT"},
+                    {"kind": "ready_stale", "task": "Z-DELETED"},
+                ],
+                now=2000,
+            )
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE kind='coordination_required'"
+            ).fetchone()[0]
+        self.assertEqual(0, count)
+
     def test_dead_managed_worker_does_not_suppress_fleet_idle(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute(

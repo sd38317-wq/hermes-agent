@@ -350,16 +350,21 @@ def emit_coordination_events(
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM task_events later "
                 "  WHERE later.id > signal.id "
+                "  AND later.task_id = signal.task_id "
                 "  AND later.kind != 'coordination_required'"
                 ") LIMIT 1",
                 (task_id, payload),
             ).fetchone()
             if exists is None:
-                conn.execute(
+                inserted = conn.execute(
                     "INSERT INTO task_events (task_id, kind, payload, created_at) "
                     "SELECT id, 'coordination_required', ?, ? FROM tasks WHERE id = ?",
                     (payload, int(now), task_id),
                 )
+                if inserted.rowcount != 1:
+                    raise RuntimeError(
+                        f"coordination signal target disappeared: {task_id}"
+                    )
         conn.commit()
     except Exception:
         conn.rollback()
