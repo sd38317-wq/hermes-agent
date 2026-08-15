@@ -301,10 +301,13 @@ def test_compression_heartbeat_stop_persists_completed_over_in_progress(
     hb = _CompressionActivityHeartbeat(agent, interval_seconds=3600.0)
     hb.start()
 
-    agent._session_activity_last_persist_mono = 0.0
+    # Persist the injected progress stamp deterministically. Resetting the
+    # internal monotonic window directly races other activity touches on a
+    # heavily loaded runner and is not the behavior this test exercises.
     agent._touch_activity(
         "context compression in progress",
         provenance=ActivityProvenance.AGENT_COMPRESSION,
+        force_persist=True,
     )
     row = db.get_session(session_id)
     assert row["last_activity_description"] == "context compression in progress"
