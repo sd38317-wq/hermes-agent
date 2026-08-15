@@ -321,6 +321,33 @@ def test_assignment_cannot_silently_clear_representative_designation(
         assert kb.active_dispatch_priority_locks(conn) == {"dev": designated}
 
 
+def test_review_routing_cannot_silently_clear_representative_designation(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        designated = kb.create_task(conn, title="locked", assignee="dev")
+        kb.set_dispatch_priority_lock(
+            conn, designated, designated_by="representative"
+        )
+
+        ok, reason = kb.request_review(
+            conn,
+            designated,
+            reviewer="research",
+            force=True,
+            with_reason=True,
+        )
+
+        assert ok is False
+        assert reason is not None
+        assert "representative priority lock is active" in reason
+        task = kb.get_task(conn, designated)
+        assert task.status == "ready"
+        assert task.assignee == "dev"
+        assert kb.active_dispatch_priority_locks(conn) == {"dev": designated}
+
+
 def test_cli_assign_reports_priority_lock_conflict_without_traceback(
     isolated_kanban_home_with_profiles,
     capsys,

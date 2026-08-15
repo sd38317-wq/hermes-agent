@@ -6737,6 +6737,18 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        if reviewer is not None and reviewer != trow["assignee"]:
+            priority_lock = conn.execute(
+                "SELECT 1 FROM dispatch_priority_locks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if priority_lock is not None:
+                return _ret(
+                    False,
+                    "cannot route review to another profile: representative "
+                    "priority lock is active. Explicitly designate a replacement "
+                    "task first.",
+                )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
