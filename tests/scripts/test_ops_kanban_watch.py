@@ -12,6 +12,8 @@ from scripts.ops import kanban_exception_watch as watch
 
 
 class WatcherTests(unittest.TestCase):
+    PROFILES = ("dev", "productdev", "research", "plan", "design")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
@@ -61,6 +63,36 @@ class WatcherTests(unittest.TestCase):
                 "--lock", str(self.lock), "--now", "2000",
             ])
         return code, out.getvalue()
+
+    def add_task(self, conn, task_id, profile, status, *, created_at=1,
+                 run_id=None, block_kind=None):
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id,title,assignee,status,created_at,current_run_id,block_kind) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (task_id, "fixture", profile, status, created_at, run_id, block_kind),
+        )
+        if run_id is not None:
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(id,task_id,status,started_at,last_heartbeat_at) "
+                "VALUES (?,?, 'running',1900,1990)",
+                (run_id, task_id),
+            )
+
+    def exceptions(self):
+        with contextlib.closing(watch._read_db(self.db)) as conn:
+            return watch.collect_exceptions(conn, 2000)
+
+    def task_state(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            return {
+                row[0]: row[1:]
+                for row in conn.execute(
+                    "SELECT id,status,assignee,current_run_id,block_kind "
+                    "FROM tasks ORDER BY id"
+                )
+            }
 
     def test_healthy_is_silent(self):
         code, output = self.run_main()
@@ -176,9 +208,8 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("fleet_idle", kinds)
 
     def test_five_active_profiles_are_not_idle(self):
-        profiles = ("dev", "productdev", "research", "plan", "design")
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
-            for index, profile in enumerate(profiles, start=20):
+            for index, profile in enumerate(self.PROFILES, start=20):
                 task_id = f"P{index}"
                 conn.execute(
                     "INSERT INTO tasks (id,title,assignee,status,created_at,current_run_id) "
@@ -195,6 +226,211 @@ class WatcherTests(unittest.TestCase):
             kinds = {item["kind"] for item in watch.collect_exceptions(conn, 2000)}
         self.assertNotIn("fleet_idle", kinds)
         self.assertNotIn("ready_stale", kinds)
+
+    def test_zero_running_with_actionable_work_reports_idle_for_every_profile(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for index, profile in enumerate(self.PROFILES):
+                self.add_task(conn, f"READY-{profile}", profile, "ready",
+                              created_at=1999 - index)
+            conn.commit()
+
+        exceptions = self.exceptions()
+        self.assertEqual(
+            [{"kind": "fleet_idle", "task": "READY-design"}],
+            [item for item in exceptions if item["kind"] == "fleet_idle"],
+        )
+        self.assertFalse(any(item["kind"] == "ready_stale" for item in exceptions))
+
+    def test_each_profile_is_managed_when_it_is_the_only_actionable_profile(self):
+        for profile in self.PROFILES:
+            with self.subTest(profile=profile), \
+                    contextlib.closing(sqlite3.connect(self.db)) as conn:
+                task_id = f"READY-{profile}"
+                self.add_task(conn, task_id, profile, "ready", created_at=1999)
+                conn.commit()
+
+                self.assertIn(
+                    {"kind": "fleet_idle", "task": task_id},
+                    self.exceptions(),
+                )
+
+                conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+                conn.commit()
+
+    def test_ready_becomes_stale_at_exactly_120_seconds(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.add_task(conn, "BEFORE", "dev", "ready", created_at=1881)
+            self.add_task(conn, "BOUNDARY", "productdev", "ready", created_at=1880)
+            conn.commit()
+
+        stale = {item["task"] for item in self.exceptions()
+                 if item["kind"] == "ready_stale"}
+        self.assertEqual({"BOUNDARY"}, stale)
+
+    def test_profile_completion_leaves_independent_followup_actionable(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for index, profile in enumerate(self.PROFILES, start=100):
+                self.add_task(conn, f"DONE-{profile}", profile, "done")
+            self.add_task(conn, "FOLLOWUP", "design", "todo", created_at=1990)
+            conn.commit()
+
+        before = self.task_state()
+        exceptions = self.exceptions()
+        self.assertIn({"kind": "promotion_drift", "task": "FOLLOWUP"}, exceptions)
+        self.assertIn({"kind": "fleet_idle", "task": "FOLLOWUP"}, exceptions)
+        self.assertEqual(before, self.task_state())
+
+    def test_all_todo_work_blocked_by_live_parents_is_not_actionable(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for index, profile in enumerate(self.PROFILES, start=200):
+                parent = f"PARENT-{profile}"
+                child = f"CHILD-{profile}"
+                self.add_task(conn, parent, profile, "running", run_id=index)
+                self.add_task(conn, child, profile, "todo", created_at=1800)
+                conn.execute(
+                    "INSERT INTO task_links (parent_id,child_id) VALUES (?,?)",
+                    (parent, child),
+                )
+            conn.commit()
+
+        exceptions = self.exceptions()
+        self.assertFalse(any(item["kind"] in {
+            "promotion_drift", "dependency_stall", "fleet_idle"
+        } for item in exceptions), exceptions)
+
+    def test_all_todo_work_with_inactive_parents_requests_coordination_only(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for profile in self.PROFILES:
+                parent = f"PARENT-{profile}"
+                child = f"CHILD-{profile}"
+                self.add_task(conn, parent, "coordinator", "todo", created_at=1)
+                self.add_task(conn, child, profile, "todo", created_at=1800)
+                conn.execute(
+                    "INSERT INTO task_links (parent_id,child_id) VALUES (?,?)",
+                    (parent, child),
+                )
+            conn.commit()
+
+        before = self.task_state()
+        exceptions = self.exceptions()
+        stalled = {item["task"] for item in exceptions
+                   if item["kind"] == "dependency_stall"}
+
+        self.assertEqual(
+            {f"CHILD-{profile}" for profile in self.PROFILES},
+            stalled,
+        )
+        self.assertFalse(any(item["kind"] in {
+            "promotion_drift", "fleet_idle"
+        } for item in exceptions), exceptions)
+        self.assertEqual(before, self.task_state())
+
+    def test_human_input_gate_is_reported_but_never_bypassed(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.add_task(conn, "APPROVAL", "plan", "blocked",
+                          block_kind="approval")
+            self.add_task(conn, "DEPENDENT", "dev", "todo", created_at=1990)
+            conn.execute(
+                "INSERT INTO task_links (parent_id,child_id) "
+                "VALUES ('APPROVAL','DEPENDENT')"
+            )
+            conn.commit()
+
+        before = self.task_state()
+        exceptions = self.exceptions()
+        self.assertIn({"kind": "human", "task": "APPROVAL"}, exceptions)
+        self.assertNotIn({"kind": "promotion_drift", "task": "DEPENDENT"}, exceptions)
+        self.assertNotIn({"kind": "fleet_idle", "task": "DEPENDENT"}, exceptions)
+        self.assertEqual(before, self.task_state())
+
+    def test_main_only_signals_and_never_claims_or_rewrites_dependencies(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.add_task(conn, "HUMAN", "research", "blocked",
+                          block_kind="input")
+            self.add_task(conn, "CHILD", "design", "todo", created_at=1800)
+            self.add_task(conn, "READY", "dev", "ready", created_at=1800)
+            conn.execute(
+                "INSERT INTO task_links (parent_id,child_id) VALUES ('HUMAN','CHILD')"
+            )
+            conn.commit()
+
+        before = self.task_state()
+        self.assertEqual(0, self.run_main()[0])
+
+        self.assertEqual(before, self.task_state())
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(
+                [("HUMAN", "CHILD")],
+                conn.execute(
+                    "SELECT parent_id,child_id FROM task_links ORDER BY parent_id,child_id"
+                ).fetchall(),
+            )
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM task_runs"
+            ).fetchone()[0])
+            self.assertEqual(
+                {"coordination_required"},
+                {row[0] for row in conn.execute("SELECT kind FROM task_events")},
+            )
+
+    def test_complete_and_block_transitions_require_next_assignment_confirmation(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            for event_id, (profile, kind, status) in enumerate((
+                ("research", "completed", "done"),
+                ("productdev", "blocked", "blocked"),
+            ), start=300):
+                task_id = kind.upper()
+                self.add_task(conn, task_id, profile, status,
+                              block_kind="dependency" if kind == "blocked" else None)
+                conn.execute(
+                    "INSERT INTO task_events (id,task_id,kind,created_at) "
+                    "VALUES (?,?,?,1990)", (event_id, task_id, kind),
+                )
+                conn.execute(
+                    "INSERT INTO kanban_notify_subs "
+                    "(task_id,platform,chat_id,thread_id,last_event_id,"
+                    "delivered_event_id,delivery_mode) VALUES (?,?,?,?,?,?,?)",
+                    (task_id, "internal", "coordinator", "", event_id,
+                     event_id - 1, "wake"),
+                )
+            conn.commit()
+
+        missing = {item["task"] for item in self.exceptions()
+                   if item["kind"] == "orchestrator_report_missing"}
+        self.assertEqual({"COMPLETED", "BLOCKED"}, missing)
+
+    def test_telegram_and_slack_normal_or_log_subscriptions_never_notify(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.add_task(conn, "FINISHED", "dev", "done")
+            conn.execute(
+                "INSERT INTO task_events (id,task_id,kind,created_at) "
+                "VALUES (401,'FINISHED','completed',1990)"
+            )
+            for platform in ("telegram", "slack"):
+                for mode in ("normal", "log"):
+                    conn.execute(
+                        "INSERT INTO kanban_notify_subs "
+                        "(task_id,platform,chat_id,thread_id,last_event_id,"
+                        "delivered_event_id,delivery_mode) VALUES "
+                        "('FINISHED',?,?, '',401,400,?)",
+                        (platform, f"{platform}-{mode}-chat", mode),
+                    )
+            conn.commit()
+
+        self.assertEqual((0, ""), self.run_main())
+        self.assertNotIn(
+            {"kind": "orchestrator_report_missing", "task": "FINISHED"},
+            self.exceptions(),
+        )
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(4, conn.execute(
+                "SELECT COUNT(*) FROM kanban_notify_subs WHERE last_event_id=401 "
+                "AND delivered_event_id=400"
+            ).fetchone()[0])
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE kind='coordination_required'"
+            ).fetchone()[0])
 
     def test_independent_todo_not_promoted_is_reported_without_mutating(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
