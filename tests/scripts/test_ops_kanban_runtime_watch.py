@@ -408,25 +408,45 @@ class RuntimeWatchTests(unittest.TestCase):
         self.assertEqual(1, len(evidence_rows))
         self.assertEqual(result["timestamp"], evidence_rows[0]["timestamp"])
 
-    def test_34_blocker_fixture_baselines_and_unchanged_second_run_is_silent(self):
+    def test_35_existing_blockers_then_new_high_priority_capability_alerts_once(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER")
             conn.executemany(
-                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (f"CARD-{index}", f"승인 요청 {index}", "plan", "blocked", 1800,
-                     None, None, None, None, "needs_input")
-                    for index in range(34)
+                     None, None, None, None, "needs_input", 1)
+                    for index in range(35)
                 ],
             )
             conn.commit()
 
-        with contextlib.closing(sqlite3.connect(self.db)) as conn:
-            self.assertEqual(
-                34,
-                conn.execute("SELECT count(*) FROM tasks WHERE status='blocked'").fetchone()[0],
-            )
         self.assertEqual((0, ""), self.run_human())
-        self.assertEqual((0, ""), self.run_human(now=2001))
+
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES "
+                "('NEW-CAPABILITY','긴급 운영 권한','ops','blocked',2001,NULL,NULL,NULL,NULL,"
+                "'capability',100)"
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (1,'NEW-CAPABILITY','blocked',?,2001)",
+                (json.dumps({
+                    "reason": "운영 권한이 없습니다. 최소 조치: 권한을 부여해 주세요."
+                }),),
+            )
+            conn.commit()
+
+        code, rendered = self.run_human(now=2001)
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            ["제목", "원인", "영향", "최소 조치", "후속 확인"],
+            [line.split(":", 1)[0] for line in rendered.strip().splitlines()],
+        )
+        self.assertIn("제목: 긴급 운영 권한", rendered)
+        self.assertNotIn("승인 요청", rendered)
+        self.assertEqual((0, ""), self.run_human(now=2002))
 
     def test_reason_action_fingerprint_ignores_title_and_alerts_on_event_reason_change(self):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:

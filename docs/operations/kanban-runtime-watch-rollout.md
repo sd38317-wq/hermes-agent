@@ -48,13 +48,18 @@ directory. Copy both reviewed files from the pushed commit to that directory:
 - `scripts/ops/run_kanban_runtime_watch.sh`
 
 Preserve executable mode `0700` or `0755` and compare SHA-256 hashes before
-scheduling `run_kanban_runtime_watch.sh`. The cron must run as a
-`no_agent=True` script job every 10 minutes. The checked-in wrapper selects
+scheduling `run_kanban_runtime_watch.sh`. The supported production alerting
+cron must run as a `no_agent=True` script job every minute with
+`deliver=origin`. The checked-in wrapper selects
 `--notification-mode human-only`: every full JSON record remains in the local
 evidence file, while stdout is empty for healthy and non-human-only findings.
 Only a genuine `human_only=true` blocker reaches the external delivery
 connection. This avoids both an LLM call and scheduler failure/noise for
 ordinary findings.
+
+An existing ten-minute job may remain only as a local, evidence-only job. It
+is not the supported production notification path and must not deliver normal
+or internal output externally.
 
 The script arguments for the installed copy must remain:
 
@@ -67,7 +72,7 @@ mutations to it.
 
 ## Three-run acceptance gate
 
-Before creating the 10-minute job, execute the exact installed command three
+Before creating the one-minute production job, execute the exact installed command three
 times sequentially. Keep all three JSONL lines. Each
 line must be complete, independently JSON-parseable, have a distinct timestamp,
 and contain non-zero input/query counts, finding/action counts, and PID
@@ -91,8 +96,8 @@ follow-ups without mutating the live board.
 - Healthy runs produce zero external alerts.
 - Internal lifecycle starts/completions produce no external alerts.
 - Only findings marked `human_only=true` may become external notifications.
-- A human notification must carry the emitted Korean `cause`, `impact`, single
-  `minimum_action`, and `follow_up` fields.
+- A human notification must carry exactly the emitted title, Korean `cause`,
+  `impact`, single `minimum_action`, and `follow_up` fields.
 - Non-human exceptions stay in local evidence and the remediation plan. A
   coordinator may apply a plan step only via the named official `kanban_*`
   tool and must record the resulting tool response.
@@ -101,24 +106,24 @@ follow-ups without mutating the live board.
 
 1. Keep `d1b35bd84781` paused.
 2. Complete the dry run, focused tests, hash check, and three-run gate.
-3. Create a new 10-minute no-agent job with an actual external connection; do
-   not reuse the old prompt-based job. For the configured Telegram home
-   connection, use:
+3. Create a new one-minute no-agent job whose delivery resolves to the
+   conversation origin; do not reuse the old prompt-based job. Use:
 
    ```bash
-   hermes cron create "every 10m" \
+   hermes cron create "every 1m" \
      --no-agent \
      --script run_kanban_runtime_watch.sh \
-     --deliver telegram \
+     --deliver origin \
      --name "kanban-runtime-watch"
    ```
 
-   `--deliver local` is not acceptance: it proves storage, not external
-   delivery. Record the new job ID and resolved delivery target in the private
-   rollout log; never put credentials in this repository.
+   `--deliver local` is not acceptance for the production alerting job: it
+   proves storage, not origin delivery. A separate ten-minute evidence-only
+   job may use local delivery. Record the production job ID and resolved origin
+   target in the private rollout log; never put credentials in this repository.
 4. Exercise all three paths through that connection: healthy and non-human-only
    runs must store evidence without a delivery; the human-only fixture must
-   deliver exactly the four Korean fields `원인`, `영향`, one `최소 조치`, and
+   deliver exactly the five fields `제목`, `원인`, `영향`, one `최소 조치`, and
    `후속 확인`. Verify all three stored records against the evidence file.
 5. Observe at least one scheduled tick before removing the old paused job.
 6. Roll back by pausing the new job only. The detector has no board mutation to
