@@ -153,8 +153,9 @@ hermes cron create "every 1m" \
 The prompt contract is strict: inspect every emitted event internally; return
 exactly `[SILENT]` for routine starts, progress, and completions; notify the
 representative only about important blockers or scope risks, in easy Korean.
-The cron interval must remain one minute so relevant lifecycle events are
-collected within one minute.
+A `status=health_error` batch is an audit-coverage incident and must be reported
+once in easy Korean rather than suppressed. The cron interval must remain one
+minute so relevant lifecycle events are collected within one minute.
 
 Before rollout, run both watcher modules:
 
