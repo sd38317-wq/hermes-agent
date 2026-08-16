@@ -178,6 +178,29 @@ class TestStreamDeltaDispatch:
 
 
 class TestToolProgressDispatch:
+    def test_ledger_skips_native_mcp_but_keeps_codex_and_external_calls(self, monkeypatch):
+        from agent import kanban_tool_ledger
+
+        recorded = []
+        monkeypatch.setattr(kanban_tool_ledger, "record", lambda *args, **kwargs: recorded.append((args, kwargs)))
+        bridge = make_codex_app_server_event_bridge(_make_stub_agent())
+        items = [
+            {"type": "mcpToolCall", "id": "native", "server": "hermes-tools", "tool": "terminal"},
+            {"type": "mcpToolCall", "id": "external", "server": "github", "tool": "search"},
+            {"type": "dynamicToolCall", "id": "dynamic", "tool": "custom"},
+            {"type": "commandExecution", "id": "command", "command": "true"},
+            {"type": "fileChange", "id": "file", "changes": []},
+        ]
+        for item in items:
+            bridge(_item_started(item))
+            bridge(_item_completed({**item, "exitCode": 0}))
+        names = [call[0][1] for call in recorded]
+        assert "terminal" not in names
+        assert names.count("mcp.github.search") == 2
+        assert names.count("custom") == 2
+        assert names.count("exec_command") == 2
+        assert names.count("apply_patch") == 2
+
     def test_command_started_fires_tool_started(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)

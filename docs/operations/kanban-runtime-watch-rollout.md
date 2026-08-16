@@ -147,8 +147,50 @@ hermes cron create "every 1m" \
   "아래 내부 칸반 이벤트를 모두 점검하세요. routine start/progress/completion만 있으면 정확히 [SILENT]를 반환하세요. 중요한 blocker 또는 scope risk만 대표자에게 쉬운 한국어로 짧게 보고하세요. 원문 카드 본문이나 내부 payload를 재현하지 마세요." \
   --script run_kanban_lifecycle_watch.sh \
   --deliver origin \
-  --name "kanban-lifecycle-coordinator"
+  --name "칸반 상태 총괄 집계"
 ```
+
+This agent job receives the sanitized lifecycle feed and internally accounts
+for creation, assignment, claim/spawn, progress and scope changes, blockers,
+resume/retry, completion, and metadata-only `tool_started` / `tool_completed`
+events. Tool arguments and results, card bodies, commands, paths, process or
+lock details, and raw payloads never enter the feed. Normal internal events are
+silent externally; only a material blocker/scope risk or coverage failure is
+reported to the representative.
+
+Install the independent read-only watchdog too:
+
+- `scripts/ops/kanban_lifecycle_guard.py`
+- `scripts/ops/run_kanban_lifecycle_guard.sh`
+
+Create it as a separate one-minute no-agent origin-delivery job:
+
+```bash
+hermes cron create "every 1m" \
+  --no-agent \
+  --script run_kanban_lifecycle_guard.sh \
+  --deliver origin \
+  --name "kanban-lifecycle-guard"
+```
+
+The guard produces empty stdout while healthy. It reports one generic,
+easy-Korean alert only when the coordinator cron becomes stale, its delivery
+fails, or watcher state/audit coverage is interrupted; unchanged incidents are
+deduplicated, and recovery arms a future recurrence.
+
+The lifecycle evidence and `tool_started` / `tool_completed` rows are append-only.
+Hermes deliberately does not delete this audit evidence automatically: operators
+must provision and monitor the containing volume and apply an approved retention or
+archive policy. The guard raises an operations/coverage incident when tool events
+exceed 1,000,000 total rows or 100,000 rows in the latest hour. These are measurable
+growth alarms, not cleanup triggers; investigate volume capacity and event rate before
+choosing a retention action.
+
+If a tool-event database write fails, the worker appends only incident kind/version/time
+metadata to `HERMES_HOME/cron/evidence/kanban-tool-ledger-incidents.jsonl`; it never
+copies a task title, tool arguments/results, identifiers, or paths. The file is locked,
+fsynced, and capped at 1 MiB. The guard alerts on every recent incident and when that cap
+is reached, so a full fallback file cannot silently hide later coverage loss.
 
 The prompt contract is strict: inspect every emitted event internally; return
 exactly `[SILENT]` for routine starts, progress, and completions; notify the
@@ -161,6 +203,7 @@ Before rollout, run both watcher modules:
 
 ```bash
 scripts/run_tests.sh tests/scripts/test_ops_kanban_lifecycle_watch.py
+scripts/run_tests.sh tests/scripts/test_ops_kanban_lifecycle_guard.py
 scripts/run_tests.sh tests/scripts/test_ops_kanban_runtime_watch.py
 ```
 

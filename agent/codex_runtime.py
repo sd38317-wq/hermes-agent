@@ -369,6 +369,14 @@ _CODEX_TOOL_ITEM_TYPES = frozenset(
 _INTERNAL_MCP_SERVER = "hermes-tools"
 
 
+def _should_ledger_codex_item(item: dict) -> bool:
+    """Avoid duplicating native Hermes MCP calls ledgered by model_tools."""
+    return not (
+        item.get("type") == "mcpToolCall"
+        and item.get("server") == _INTERNAL_MCP_SERVER
+    )
+
+
 def _codex_item_to_tool_name(item: dict) -> str:
     """Synthetic Hermes tool name for a codex item. Mirrors
     CodexEventProjector so the progress bubble and the projected
@@ -545,6 +553,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         args = _codex_item_to_args(item)
         if item_id:
             started[item_id] = (name, args, time.monotonic())
+        try:
+            from agent.kanban_tool_ledger import record
+
+            if _should_ledger_codex_item(item):
+                record("tool_started", name, _stable_call_id(item, name))
+        except Exception:
+            logger.debug("kanban tool-start ledger hook failed", exc_info=True)
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
@@ -582,6 +597,25 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         elif prior is not None:
             duration = time.monotonic() - prior[2]
         result, is_error = _codex_item_completion_payload(item)
+        try:
+            from agent.kanban_tool_ledger import record
+
+            # Some Codex versions omit item/started for very fast tools. Keep
+            # the durable protocol paired even when the transport only gives
+            # us the completion notification.
+            if prior is None and _should_ledger_codex_item(item):
+                record("tool_started", name, _stable_call_id(item, name))
+            status = "cancelled" if str(item.get("status", "")).lower() in {
+                "cancelled", "canceled", "interrupted"
+            } else ("error" if is_error else "success")
+            if _should_ledger_codex_item(item):
+                record(
+                    "tool_completed", name, _stable_call_id(item, name),
+                    status=status,
+                    duration_ms=None if duration is None else duration * 1000,
+                )
+        except Exception:
+            logger.debug("kanban tool-complete ledger hook failed", exc_info=True)
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:

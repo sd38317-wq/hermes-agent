@@ -27,6 +27,7 @@ import asyncio
 import logging
 import threading
 import time
+import functools
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import (
@@ -1167,7 +1168,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
-def handle_function_call(
+def _handle_function_call_impl(
     function_name: str,
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
@@ -1586,6 +1587,33 @@ def handle_function_call(
             middleware_trace=list(_tool_middleware_trace),
         )
         return result
+
+
+@functools.wraps(_handle_function_call_impl)
+def handle_function_call(*args, **kwargs) -> str:
+    """Dispatch a tool and best-effort ledger its lifecycle for real workers."""
+    from agent.kanban_tool_ledger import opaque_call_id, record, result_status
+
+    function_name = kwargs.get("function_name") or (args[0] if args else "unknown")
+    supplied_call_id = kwargs.get("tool_call_id")
+    call_id = opaque_call_id(supplied_call_id, tool_name=str(function_name))
+    started = time.monotonic()
+    record("tool_started", str(function_name), call_id)
+    try:
+        result = _handle_function_call_impl(*args, **kwargs)
+    except BaseException as exc:
+        record(
+            "tool_completed", str(function_name), call_id,
+            status=result_status(exc),
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+        raise
+    record(
+        "tool_completed", str(function_name), call_id,
+        status=result_status(result),
+        duration_ms=(time.monotonic() - started) * 1000,
+    )
+    return result
 
 
 # =============================================================================

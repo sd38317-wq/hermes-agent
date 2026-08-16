@@ -17,7 +17,10 @@ from scripts.ops import kanban_lifecycle_watch as watch
 
 CATEGORY_CASES = {
     "start": ("claimed", "spawned"),
-    "progress": ("commented", "attached", "claim_extended", "retry_model_selected"),
+    "progress": (
+        "commented", "attached", "claim_extended", "retry_model_selected",
+        "tool_started", "tool_completed",
+    ),
     "scope_change": watch.CATEGORY_KINDS["scope_change"],
     "blocked": watch.CATEGORY_KINDS["blocked"],
     "resumed": watch.CATEGORY_KINDS["resumed"],
@@ -28,7 +31,7 @@ CATEGORY_CASES = {
 # Production also writes task events through dynamic event_kind variables and
 # direct dashboard SQL, not only literal _append_event(...) calls.
 PRODUCTION_EXTRA_KINDS = {
-    "coordination_required", "crashed", "protocol_violation", "rate_limited",
+    "coordination_required", "coverage_gap", "crashed", "protocol_violation", "rate_limited",
     "reprioritized", "spawn_failed",
 }
 
@@ -93,9 +96,133 @@ class LifecycleWatchTests(unittest.TestCase):
         emitted = {(event["category"], event["kind"]) for event in batch["events"]}
         self.assertEqual(
             {(category, kind) for category, kinds in CATEGORY_CASES.items()
-             if category != "internal" for kind in kinds},
+            if category != "internal" for kind in kinds},
             emitted,
         )
+
+    def test_stale_unmatched_tool_is_coverage_error_without_cursor_advance(self):
+        self.add_event("claimed", {"run_id": "R1"}, created_at=1000)
+        self.assertEqual((0, None), self.run_watch())
+        before = self.state.read_text()
+        self.add_event("tool_started", {"tool": "terminal", "call_id": "opaque"}, created_at=1001)
+        code, result = self.run_watch()
+        self.assertEqual((2, "coverage_error"), (code, result["status"]))
+        self.assertEqual(before, self.state.read_text())
+
+    def test_completed_task_and_attachment_omissions_are_coverage_errors(self):
+        self.add_event("claimed")
+        self.assertEqual((0, None), self.run_watch())
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='completed' WHERE id='T1'")
+            conn.execute(
+                "CREATE TABLE task_attachments (id TEXT, task_id TEXT, filename TEXT, size INTEGER)"
+            )
+            conn.execute("INSERT INTO task_attachments VALUES ('A1','T1','missing.txt',9)")
+            conn.commit()
+        code, result = self.run_watch()
+        self.assertEqual((2, "coverage_error"), (code, result["status"]))
+        self.assertIn("attachment", result["error"])
+        self.assertIn("completed", result["error"])
+
+    def test_old_completion_and_real_attachment_payload_survive_newer_event_window(self):
+        self.add_event("completed", created_at=1000)
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE tasks SET status='completed' WHERE id='T1'")
+            conn.execute("CREATE TABLE task_attachments (id INTEGER, task_id TEXT, filename TEXT, size INTEGER)")
+            conn.execute("INSERT INTO task_attachments VALUES (1,'T1','proof.txt',17)")
+            conn.execute(
+                "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+                ("T1", "attached", json.dumps({"filename": "proof.txt", "size": 17, "by": "worker"}), 1001),
+            )
+            for offset in range(watch.MAX_RECONCILE_ROWS + 10):
+                conn.execute(
+                    "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES ('T1','heartbeat',NULL,?)",
+                    (1100 + offset,),
+                )
+            conn.commit()
+        code, result = self.run_watch()
+        self.assertEqual((0, None), (code, result))
+
+    def test_reconciliation_limits_fail_closed_before_scanning(self):
+        self.add_event("claimed")
+        self.assertEqual((0, None), self.run_watch())
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.executemany(
+                "INSERT INTO tasks (id,title,assignee,status) VALUES (?,?,?,?)",
+                [(f"extra-{i}", "safe", None, "pending") for i in range(watch.MAX_RECONCILE_ROWS)],
+            )
+            conn.commit()
+        code, result = self.run_watch()
+        self.assertEqual((2, "coverage_error"), (code, result["status"]))
+        self.assertIn("capacity exceeded", result["error"])
+
+    def test_running_run_requires_event_for_that_run_when_supported(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE task_events ADD COLUMN run_id TEXT")
+            conn.execute("CREATE TABLE task_runs (id TEXT, task_id TEXT, status TEXT)")
+            conn.execute("INSERT INTO task_runs VALUES ('new-run','T1','running')")
+            conn.execute(
+                "INSERT INTO task_events (task_id,run_id,kind,payload,created_at) VALUES (?,?,?,?,?)",
+                ("T1", "old-run", "claimed", None, 1000),
+            )
+            conn.commit()
+        self.assertEqual((0, None), self.run_watch())
+        code, result = self.run_watch()
+        self.assertEqual((2, "coverage_error"), (code, result["status"]))
+        self.assertIn("running run", result["error"])
+
+    def test_run_and_attachment_limits_fail_closed(self):
+        self.add_event("claimed")
+        self.assertEqual((0, None), self.run_watch())
+        for table, ddl, insert, rows in (
+            (
+                "task_runs", "CREATE TABLE task_runs (id TEXT, task_id TEXT, status TEXT)",
+                "INSERT INTO task_runs VALUES (?,?,?)",
+                [(f"run-{i}", "T1", "running") for i in range(watch.MAX_RECONCILE_ROWS + 1)],
+            ),
+            (
+                "task_attachments", "CREATE TABLE task_attachments (id TEXT, task_id TEXT, filename TEXT, size INTEGER)",
+                "INSERT INTO task_attachments VALUES (?,?,?,?)",
+                [(f"a-{i}", "T1", f"f-{i}", i) for i in range(watch.MAX_RECONCILE_ROWS + 1)],
+            ),
+        ):
+            with self.subTest(table=table), contextlib.closing(sqlite3.connect(self.db)) as conn:
+                conn.execute(ddl)
+                conn.executemany(insert, rows)
+                conn.commit()
+                code, result = self.run_watch()
+                self.assertEqual((2, "coverage_error"), (code, result["status"]))
+                self.assertIn("capacity exceeded", result["error"])
+                conn.execute(f"DROP TABLE {table}")
+                conn.commit()
+
+    def test_orphan_running_task_after_empty_baseline_is_coverage_error(self):
+        self.assertEqual((0, None), self.run_watch())
+        code, result = self.run_watch()
+        self.assertEqual((2, "coverage_error"), (code, result["status"]))
+
+    def test_managed_worktree_change_requires_successful_mutation_tool(self):
+        workspace = self.root / "kanban" / "workspaces" / "T1"
+        workspace.mkdir(parents=True)
+        artifact = workspace / "artifact.txt"
+        artifact.write_text("one")
+        with contextlib.closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE tasks ADD COLUMN workspace_kind TEXT")
+            conn.execute("ALTER TABLE tasks ADD COLUMN workspace_path TEXT")
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='worktree',workspace_path=? WHERE id='T1'",
+                (str(workspace),),
+            )
+            conn.commit()
+        self.add_event("claimed")
+        self.add_event("tool_completed", {
+            "tool": "apply_patch", "call_id": "opaque", "status": "success",
+        }, created_at=1001)
+        self.assertEqual((0, None), self.run_watch())
+        artifact.write_text("two")
+        code, result = self.run_watch()
+        self.assertEqual((2, "coverage_error"), (code, result["status"]))
+        self.assertIn("worktree", result["error"])
 
     def test_literal_append_event_kinds_are_exhaustively_classified(self):
         source = Path("hermes_cli/kanban_db.py").read_text(encoding="utf-8")
