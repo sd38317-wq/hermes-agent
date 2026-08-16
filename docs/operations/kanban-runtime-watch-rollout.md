@@ -102,6 +102,67 @@ follow-ups without mutating the live board.
   coordinator may apply a plan step only via the named official `kanban_*`
   tool and must record the resulting tool response.
 
+## Internal lifecycle coordinator feed
+
+This is a separate job from the human-only runtime blocker watch above. Do not
+alter, replace, resume, or remove the human-blocker no-agent job when installing
+the lifecycle feed.
+
+`scripts/ops/kanban_lifecycle_watch.py` reads `task_events` through a read-only
+SQLite connection. It keeps an atomic cursor, appends a sanitized audit record
+to `/opt/data/cron/evidence/kanban-lifecycle-watch.jsonl`, and prints at most one
+bounded JSON batch. The batch contains coordinator lifecycle metadata only; it
+never contains card bodies, full event payloads, credentials, PIDs, claim-lock
+values, or other internal identifiers. Heartbeats and classified internal
+events are aggregated by count in the local audit without representative text
+and advance the validated cursor without producing coordinator input. An
+unknown event kind fails closed with `health_error` and does not advance the
+cursor.
+
+The audit proves only that the watcher read, sanitized, and durably recorded a
+batch locally. It is not proof that the cron runner invoked an agent or that an
+origin received a notification. Operators must monitor the lifecycle cron
+entry in `/opt/data/cron/jobs.json`: a non-`ok` `last_status` or a non-empty
+`last_delivery_error` is a delivery-path incident. Hermes does not provide a
+downstream recipient acknowledgement here, so rollout and ongoing checks must
+not describe the audit record as end-to-end delivery evidence.
+
+The first production run establishes a silent baseline. Use `--from-start`
+only with an isolated fixture database during acceptance. A malformed cursor,
+missing task, incomplete schema, cursor rollback, or event-ID gap is a
+`health_error`; treat that as loss of audit coverage and investigate it rather
+than advancing or recreating the state file.
+
+Install these reviewed files under the coordinator profile's
+`HERMES_HOME/scripts` and preserve executable mode on the wrapper:
+
+- `scripts/ops/kanban_lifecycle_watch.py`
+- `scripts/ops/run_kanban_lifecycle_watch.sh`
+
+Create a distinct, LLM-driven one-minute coordinator job (do not pass
+`--no-agent`):
+
+```bash
+hermes cron create "every 1m" \
+  "아래 내부 칸반 이벤트를 모두 점검하세요. routine start/progress/completion만 있으면 정확히 [SILENT]를 반환하세요. 중요한 blocker 또는 scope risk만 대표자에게 쉬운 한국어로 짧게 보고하세요. 원문 카드 본문이나 내부 payload를 재현하지 마세요." \
+  --script run_kanban_lifecycle_watch.sh \
+  --deliver origin \
+  --name "kanban-lifecycle-coordinator"
+```
+
+The prompt contract is strict: inspect every emitted event internally; return
+exactly `[SILENT]` for routine starts, progress, and completions; notify the
+representative only about important blockers or scope risks, in easy Korean.
+The cron interval must remain one minute so relevant lifecycle events are
+collected within one minute.
+
+Before rollout, run both watcher modules:
+
+```bash
+scripts/run_tests.sh tests/scripts/test_ops_kanban_lifecycle_watch.py
+scripts/run_tests.sh tests/scripts/test_ops_kanban_runtime_watch.py
+```
+
 ## Cutover
 
 1. Keep `d1b35bd84781` paused.
