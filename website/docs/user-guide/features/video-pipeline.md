@@ -46,6 +46,8 @@ The agent calls the tool and gets back the output directory, file paths, the tit
 | `output_dir` | per-video folder under the Hermes home | |
 | `cue_seconds` | `8` | Target subtitle cue length, 2–30 |
 | `clean_captions` | `true` | Fix recognizer spacing/mishearings — see below |
+| `script` | — | The script you already have; text or a path |
+| `subtitles_path` | — | An edited `.srt`/`.vtt` to burn as-is |
 | `subtitle_formats` | `["srt", "vtt"]` | |
 | `title_count` | `5` | 1–12 |
 | `title_language` | transcript language | e.g. `"Korean"` |
@@ -66,7 +68,7 @@ You get two files: `subtitles.ass` (the styling in an editable format Premiere a
 
 | Key | Default | Notes |
 |---|---|---|
-| `preset` | `shorts` | `shorts` (big bold white, heavy outline), `yellow`, `minimal`, `boxed` |
+| `preset` | `shorts` | `shorts` (big bold white, heavy outline), `yellow`, `minimal`, `boxed`, `drama` |
 | `font` | best installed | Family name or a path to a `.ttf`/`.otf` |
 | `font_scale` | `0.052` | Fraction of video **height**, not pixels |
 | `font_size` | — | Absolute pixels; overrides `font_scale` |
@@ -103,6 +105,8 @@ The title gets its own style row in the `.ass`, so it can be repositioned or rec
 
 ### Fonts
 
+`font` also takes a *kind* of face rather than a family: `serif` (or `명조`/`사극`) picks the best installed Korean serif — Nanum Myeongjo → Gowun Batang → Song Myung → Noto Serif KR — and `sans`/`고딕` does the same for the sans list. That is what the `drama` preset uses: a period piece captioned in a geometric sans reads as a tutorial *about* a period piece.
+
 **Korean captions need a Korean font.** libass silently substitutes when a family is missing, and the usual result is a wall of tofu boxes discovered after the export. The pipeline checks what is installed before rendering, prefers a Hangul-capable face when the transcript contains Hangul (Pretendard → Noto Sans KR → Noto Sans CJK KR → NanumGothic → the macOS/Windows system faces), and reports what it picked in `captions.font`. A missing requested font is a warning in the result, not a surprise later.
 
 ```bash
@@ -120,6 +124,26 @@ Hermes' speech-to-text layer is provider-agnostic and returns text, not timestam
 4. Silence-only stretches are never sent, which saves requests and avoids the empty-audio hallucinations whisper-family models are prone to.
 
 **This means one speech-to-text request per cue.** A 10-minute talking-head video at the default `cue_seconds: 8` is roughly 60–75 requests. Local faster-whisper makes that free; on a paid API, raise `cue_seconds` to 20–30 to cut the request count by 3x, at the cost of longer lines on screen. Local backends are transcribed one window at a time (they share a single model instance); cloud backends run a couple of windows in parallel.
+
+## When you already have the script
+
+Scripted video — an AI short, a narrated explainer, an ad — is written before it is shot, so the words are known exactly and recognizing them again only introduces errors. Pass `script` and the recognizer is used for **timing only**: each cue keeps the start and end the audio gave it, and its text is cut out of the script at the matching position.
+
+```
+이 영상 자막 만들어줘. 대본은 script.txt에 있어
+```
+
+The alignment is judged by how much of what was *heard* the script accounts for, so a full episode script against one clip still aligns (and says how much went unused), while a genuinely wrong script is refused and the recognized text is kept. Cues the script does not cover — an ad-lib, a scene nobody wrote down — keep their recognized text, so a partial script helps where it applies instead of corrupting the rest. When a script is used, the cleanup pass is skipped: the author's words are the source of truth and nothing should rewrite them.
+
+## When you want to fix the words yourself
+
+Nobody gets every word from audio, and the last 5% is faster to type than to coax out of a model. Edit `subtitles.srt`, then re-run with `subtitles_path` pointing at it:
+
+```
+subtitles.srt 고쳐놨어. 그걸로 다시 구워줘
+```
+
+That path skips transcription entirely — no speech-to-text, no cleanup, no cost. Your timings and your wording are used exactly as written, and only the burn runs. The parser is deliberately forgiving about what hand-editing does to a file: missing index lines, CRLF, a stray BOM, `.`-separated WebVTT timings and cp949 encoding all read fine, and a block that is genuinely broken is skipped with a warning rather than throwing the file away.
 
 ## Fixing what the recognizer got wrong
 

@@ -213,6 +213,7 @@ class PipelineResult:
     captions: Dict[str, Any] = field(default_factory=dict)
     titles: List[str] = field(default_factory=list)
     cleaned_cues: int = 0
+    scripted_cues: int = 0
     thumbnails: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -235,6 +236,8 @@ class PipelineResult:
             payload["subtitles"] = dict(self.subtitles)
             if self.cleaned_cues:
                 payload["subtitles"]["cleaned_cues"] = self.cleaned_cues
+            if self.scripted_cues:
+                payload["subtitles"]["scripted_cues"] = self.scripted_cues
         if self.captions:
             payload["captions"] = self.captions
         if self.titles:
@@ -1427,6 +1430,8 @@ def run_pipeline(
     stt_concurrency: Optional[int] = None,
     subtitle_formats: Sequence[str] = ("srt", "vtt"),
     clean_captions: bool = True,
+    script: Optional[str] = None,
+    subtitles_path: Optional[str] = None,
     caption_style: Optional[Dict[str, Any]] = None,
     title_overlay: Any = None,
     title_count: int = DEFAULT_TITLE_COUNT,
@@ -1470,6 +1475,17 @@ def run_pipeline(
     result = PipelineResult(output_dir=str(target_dir), video=info)
 
     needs_transcript = bool(requested & {STAGE_SUBTITLES, STAGE_TITLES, STAGE_BURN})
+
+    # Hand-edited subtitles replace transcription entirely: the words and the
+    # timings are already right, so re-running STT would only undo the edits.
+    supplied_cues: List[Cue] = []
+    if subtitles_path and needs_transcript:
+        from tools.video_script import load_subtitle_cues
+
+        supplied_cues, subtitle_warnings = load_subtitle_cues(subtitles_path)
+        result.warnings.extend(subtitle_warnings)
+        needs_transcript = False
+
     needs_audio = needs_transcript or STAGE_AUDIO in requested
 
     # ── audio ────────────────────────────────────────────────────────────
@@ -1491,7 +1507,7 @@ def run_pipeline(
                 result.stages.append(STAGE_AUDIO)
 
     # ── transcript + subtitles ───────────────────────────────────────────
-    cues: List[Cue] = []
+    cues: List[Cue] = list(supplied_cues)
     if needs_transcript and result.audio_path:
         silences = detect_silences(result.audio_path, duration, ffmpeg=ffmpeg)
         windows = plan_cue_windows(duration, silences, cue_seconds=cue_seconds)
@@ -1511,6 +1527,26 @@ def run_pipeline(
             transcriber=transcriber,
         )
         result.warnings.extend(cue_warnings)
+
+        # A script the caller already has beats anything recognized from the
+        # audio: keep the timing the recognizer gave us, take the words from
+        # the script.
+        if script and cues:
+            from tools.video_script import align_script
+
+            aligned, align_warnings, replaced = align_script(
+                [cue.text for cue in cues], script
+            )
+            for cue, text in zip(cues, aligned):
+                cue.text = text
+            result.warnings.extend(align_warnings)
+            if replaced:
+                logger.info("script aligned onto %d of %d cues", replaced, len(cues))
+                result.scripted_cues = replaced
+                # The script is the source of truth; there is nothing for the
+                # cleanup model to correct, and letting it rewrite the author's
+                # own words would be a regression.
+                clean_captions = False
 
         # Recognizer output is heard right but written badly — no spacing from
         # Korean models, words misheard that context disambiguates. Correcting
@@ -1539,20 +1575,22 @@ def run_pipeline(
         else:
             result.warnings.append("transcription produced no text — check the STT provider in `hermes tools`")
 
-        if STAGE_SUBTITLES in requested and cues:
-            written: Dict[str, str] = {}
-            if "srt" in subtitle_formats:
-                srt_path = target_dir / "subtitles.srt"
-                srt_path.write_text(format_srt(cues), encoding="utf-8")
-                written["srt"] = str(srt_path)
-            if "vtt" in subtitle_formats:
-                vtt_path = target_dir / "subtitles.vtt"
-                vtt_path.write_text(format_vtt(cues), encoding="utf-8")
-                written["vtt"] = str(vtt_path)
-            if written:
-                written["cue_count"] = len(cues)
-                result.subtitles = written
-                result.stages.append(STAGE_SUBTITLES)
+    # Written for transcribed and hand-supplied cues alike — an edited .srt
+    # that only needs re-burning still round-trips through the same writer.
+    if cues and STAGE_SUBTITLES in requested:
+        written: Dict[str, str] = {}
+        if "srt" in subtitle_formats:
+            srt_path = target_dir / "subtitles.srt"
+            srt_path.write_text(format_srt(cues), encoding="utf-8")
+            written["srt"] = str(srt_path)
+        if "vtt" in subtitle_formats:
+            vtt_path = target_dir / "subtitles.vtt"
+            vtt_path.write_text(format_vtt(cues), encoding="utf-8")
+            written["vtt"] = str(vtt_path)
+        if written:
+            written["cue_count"] = len(cues)
+            result.subtitles = written
+            result.stages.append(STAGE_SUBTITLES)
 
     # ── titles ───────────────────────────────────────────────────────────
     if STAGE_TITLES in requested:

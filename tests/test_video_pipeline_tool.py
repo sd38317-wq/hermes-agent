@@ -171,6 +171,38 @@ def test_stage_order_is_normalised_to_pipeline_order(video_file, monkeypatch):
     assert captured["stages"] == ["audio", "thumbnails"]
 
 
+def test_an_inline_script_is_passed_through_verbatim(video_file, monkeypatch):
+    """A block of dialogue is not a filename — asking the filesystem about one
+    raises "File name too long" rather than answering no."""
+    captured = _capture(monkeypatch)
+    script = "굶어 죽을 거야?\n아니면 나와 함께 싸울 거야?\n" * 5
+    vpt.video_pipeline(str(video_file), script=script)
+    assert captured["script"] == script
+
+
+def test_a_script_given_as_a_path_is_read_from_disk(video_file, tmp_path, monkeypatch):
+    captured = _capture(monkeypatch)
+    script_file = tmp_path / "script.txt"
+    script_file.write_text("호미를 내려놓고 칼을 들어.", encoding="utf-8")
+    vpt.video_pipeline(str(video_file), script=str(script_file))
+    assert captured["script"] == "호미를 내려놓고 칼을 들어."
+
+
+def test_a_script_path_that_does_not_exist_is_treated_as_text(video_file, monkeypatch):
+    captured = _capture(monkeypatch)
+    vpt.video_pipeline(str(video_file), script="/nowhere/missing.txt")
+    assert captured["script"] == "/nowhere/missing.txt"
+
+
+def test_subtitles_path_is_forwarded_and_blank_means_none(video_file, monkeypatch):
+    captured = _capture(monkeypatch)
+    vpt.video_pipeline(str(video_file), subtitles_path=" /tmp/edited.srt ")
+    assert captured["subtitles_path"] == "/tmp/edited.srt"
+
+    vpt.video_pipeline(str(video_file), subtitles_path="   ")
+    assert captured["subtitles_path"] is None
+
+
 # ── result envelope ─────────────────────────────────────────────────────────
 
 

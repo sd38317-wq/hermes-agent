@@ -686,6 +686,59 @@ def test_cleanup_can_be_turned_off(tmp_path):
 
 
 @requires_ffmpeg
+def test_an_edited_subtitle_file_replaces_transcription_entirely(tmp_path):
+    """The edit-and-re-burn loop: no STT, no cleanup, the user's words as-is."""
+    def _explode(*_args, **_kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("transcription ran despite subtitles_path")
+
+    video = _make_video(tmp_path / "clip.mp4")
+    edited = tmp_path / "edited.srt"
+    edited.write_text(
+        "1\n00:00:00,500 --> 00:00:03,000\n손으로 고친 자막\n\n"
+        "2\n00:00:03,500 --> 00:00:05,500\n두 번째 줄\n",
+        encoding="utf-8",
+    )
+
+    result = run_pipeline(
+        str(video),
+        stages=["subtitles"],
+        output_dir=str(tmp_path / "out"),
+        subtitles_path=str(edited),
+        transcriber=_explode,
+        llm=_explode,
+    )
+
+    srt = Path(result.subtitles["srt"]).read_text(encoding="utf-8")
+    assert "손으로 고친 자막" in srt
+    assert "00:00:00,500 --> 00:00:03,000" in srt
+    assert result.subtitles["cue_count"] == 2
+    assert result.cleaned_cues == 0
+
+
+@requires_ffmpeg
+def test_a_script_overrides_the_recognized_words_but_not_the_timings(tmp_path):
+    def _misheard(path, model=None):
+        return {"success": True, "transcript": "고민을내려놓고칼을들어", "provider": "fake"}
+
+    def _no_cleanup(**_kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("the cleanup model ran over an authored script")
+
+    video = _make_video(tmp_path / "clip.mp4")
+    result = run_pipeline(
+        str(video),
+        stages=["subtitles"],
+        output_dir=str(tmp_path / "out"),
+        cue_seconds=3.0,
+        script="호미를 내려놓고 칼을 들어.",
+        transcriber=_misheard,
+        llm=_no_cleanup,
+    )
+    srt = Path(result.subtitles["srt"]).read_text(encoding="utf-8")
+    assert "호미를" in srt and "고민을" not in srt
+    assert result.scripted_cues > 0
+
+
+@requires_ffmpeg
 def test_thumbnails_only_run_skips_audio_and_stt(tmp_path):
     """Asking for one stage must not silently pay for the others."""
     def _explode(*_args, **_kwargs):  # pragma: no cover - must never be called

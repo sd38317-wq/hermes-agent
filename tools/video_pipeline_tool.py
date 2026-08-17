@@ -115,6 +115,27 @@ VIDEO_PIPELINE_SCHEMA: Dict[str, Any] = {
                     "proportionally fewer speech-to-text requests."
                 ),
             },
+            "script": {
+                "type": "string",
+                "description": (
+                    "The video's script, if you already have one — scripted "
+                    "content (an AI short, a narrated explainer, an ad) has "
+                    "exact words that do not need guessing. The recognizer is "
+                    "still used for timing, but each cue's text is taken from "
+                    "the script, so spelling, spacing and names are the "
+                    "author's. Pass the text itself or a path to a .txt file. "
+                    "Cues the script does not cover keep their recognized text."
+                ),
+            },
+            "subtitles_path": {
+                "type": "string",
+                "description": (
+                    "Path to an existing .srt/.vtt to use instead of "
+                    "transcribing — the way to re-burn after fixing wording by "
+                    "hand. Its timings and text are used as-is: no "
+                    "speech-to-text, no cleanup, no cost."
+                ),
+            },
             "clean_captions": {
                 "type": "boolean",
                 "description": (
@@ -306,6 +327,22 @@ def _resolve_video_path(raw: str) -> Path:
         return Path.cwd() / candidate
 
 
+SCRIPT_FILE_SUFFIXES = (".txt", ".md", ".srt", ".vtt", ".text")
+
+
+def _looks_like_script_path(value: str) -> bool:
+    """True when ``script`` is a filename rather than the script itself.
+
+    The script is usually passed inline, and a multi-line block of dialogue is
+    not a path — asking the filesystem about one raises "File name too long"
+    rather than answering False.
+    """
+    text = value.strip()
+    if not text or "\n" in text or len(text) > 255:
+        return False
+    return text.lower().endswith(SCRIPT_FILE_SUFFIXES) or "/" in text or "\\" in text
+
+
 def _coerce_stages(raw: Any) -> Optional[List[str]]:
     """Normalize the ``stages`` argument, or None when it names nothing valid."""
     if raw is None:
@@ -347,6 +384,8 @@ def video_pipeline(
     caption_style: Any = None,
     title_overlay: Any = None,
     clean_captions: Any = None,
+    script: Any = None,
+    subtitles_path: Any = None,
 ) -> str:
     """Run the video pipeline and return its JSON result."""
     if not isinstance(video_path, str) or not video_path.strip():
@@ -383,6 +422,19 @@ def video_pipeline(
     if not formats:
         formats = list(SUBTITLE_FORMATS)
 
+    script_text = script if isinstance(script, str) else None
+    if script_text and _looks_like_script_path(script_text):
+        candidate = _resolve_video_path(script_text)
+        try:
+            is_file = candidate.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
+            try:
+                script_text = candidate.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError) as exc:
+                return tool_error(f"could not read the script file: {exc}")
+
     try:
         result = run_pipeline(
             str(resolved),
@@ -391,6 +443,8 @@ def video_pipeline(
             cue_seconds=_coerce_float(cue_seconds, DEFAULT_CUE_SECONDS, MIN_CUE_SECONDS, MAX_CUE_SECONDS),
             subtitle_formats=formats,
             clean_captions=clean_captions is not False,
+            script=script_text,
+            subtitles_path=(subtitles_path or "").strip() or None,
             title_count=_coerce_int(title_count, DEFAULT_TITLE_COUNT, 1, MAX_TITLE_COUNT),
             title_language=(title_language or "").strip() or None,
             thumbnail_count=_coerce_int(
@@ -429,6 +483,8 @@ def _handle_video_pipeline(args: Dict[str, Any], **_kwargs: Any) -> str:
         caption_style=args.get("caption_style"),
         title_overlay=args.get("title_overlay"),
         clean_captions=args.get("clean_captions"),
+        script=args.get("script"),
+        subtitles_path=args.get("subtitles_path"),
     )
 
 

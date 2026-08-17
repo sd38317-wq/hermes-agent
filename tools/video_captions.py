@@ -73,6 +73,21 @@ KOREAN_FONT_CANDIDATES = (
     "Malgun Gothic",
     "Spoqa Han Sans Neo",
 )
+# Serif faces for period pieces. A 사극 (historical drama) captioned in a
+# geometric sans reads as a YouTube tutorial about a historical drama; the
+# 명조/serif family is what the genre is set in. Same ordering logic as above:
+# the designer favourite first, then what actually ships on each OS.
+KOREAN_SERIF_CANDIDATES = (
+    "Nanum Myeongjo",
+    "NanumMyeongjo",
+    "Gowun Batang",
+    "Song Myung",
+    "Noto Serif KR",
+    "Noto Serif CJK KR",
+    "AppleMyungjo",
+    "Batang",
+)
+
 LATIN_FONT_CANDIDATES = (
     "Montserrat",
     "Helvetica Neue",
@@ -150,6 +165,15 @@ PRESETS: Dict[str, CaptionStyle] = {
         max_lines=2,
     ),
     "boxed": CaptionStyle(font_scale=0.042, box=True, margin_scale=0.09),
+    # Period drama: serif face, a shade smaller and less shouty than `shorts`,
+    # with a heavier shadow so it holds over the dusty, low-contrast grades the
+    # genre favours.
+    "drama": CaptionStyle(
+        font="serif",
+        font_scale=0.048,
+        margin_scale=0.14,
+        outline_color="#1A1008",
+    ),
 }
 DEFAULT_PRESET = "shorts"
 
@@ -383,6 +407,19 @@ def _platform_default_font(needs_hangul: bool) -> str:
     return "Noto Sans CJK KR" if needs_hangul else "DejaVu Sans"
 
 
+# Requesting a *kind* of face rather than a family name, so a preset can say
+# "serif" and still land on whatever serif the user actually has installed.
+FONT_ALIASES = {
+    "serif": KOREAN_SERIF_CANDIDATES,
+    "myeongjo": KOREAN_SERIF_CANDIDATES,
+    "명조": KOREAN_SERIF_CANDIDATES,
+    "사극": KOREAN_SERIF_CANDIDATES,
+    "sans": KOREAN_FONT_CANDIDATES,
+    "gothic": KOREAN_FONT_CANDIDATES,
+    "고딕": KOREAN_FONT_CANDIDATES,
+}
+
+
 def resolve_font(requested: str, text: str = "") -> FontChoice:
     """Pick the font to render with, preferring one that can draw *text*.
 
@@ -397,6 +434,20 @@ def resolve_font(requested: str, text: str = "") -> FontChoice:
     warnings: List[str] = []
 
     requested = (requested or "").strip()
+
+    alias = FONT_ALIASES.get(requested.lower())
+    if alias:
+        for family in alias:
+            if family in installed:
+                return FontChoice(family=family, warnings=warnings)
+        fallback = _platform_default_font(needs_hangul)
+        if installed:
+            warnings.append(
+                f"no {requested} Korean font is installed — using {fallback!r}. "
+                "Install Nanum Myeongjo or Noto Serif KR for a period look."
+            )
+        return FontChoice(family=fallback, warnings=warnings)
+
     if requested:
         candidate = Path(requested).expanduser()
         if candidate.suffix.lower() in {".ttf", ".otf", ".ttc", ".otc"} or candidate.exists():
