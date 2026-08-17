@@ -80,6 +80,13 @@ LATIN_FONT_CANDIDATES = (
     "Noto Sans",
 )
 
+# The hook title sits at the top, larger than the captions and clear of them.
+# It is the first thing a scrolling viewer reads, so it defaults to staying up
+# for the whole clip rather than flashing past in the first seconds.
+DEFAULT_TITLE_FONT_SCALE = 0.062
+DEFAULT_TITLE_MARGIN_SCALE = 0.09
+DEFAULT_TITLE_MAX_LINES = 3
+
 POSITIONS = ("bottom", "center", "top")
 # ASS alignment codes: 1-3 bottom, 4-6 middle, 7-9 top (left/centre/right).
 _ALIGNMENT = {"bottom": 2, "center": 5, "top": 8}
@@ -146,38 +153,105 @@ PRESETS: Dict[str, CaptionStyle] = {
 DEFAULT_PRESET = "shorts"
 
 
+TITLE_STYLE = CaptionStyle(
+    font_scale=DEFAULT_TITLE_FONT_SCALE,
+    position="top",
+    margin_scale=DEFAULT_TITLE_MARGIN_SCALE,
+    max_lines=DEFAULT_TITLE_MAX_LINES,
+)
+
+
+@dataclass
+class TitleOverlay:
+    """A hook title rendered over the video, independent of the captions."""
+
+    text: str
+    start: float = 0.0
+    end: Optional[float] = None      # None = to the end of the video
+    style: CaptionStyle = field(default_factory=lambda: replace(TITLE_STYLE))
+
+
+def _apply_overrides(
+    style: CaptionStyle, options: Dict[str, Any], label: str
+) -> Tuple[CaptionStyle, List[str]]:
+    """Set known style fields from *options*, reporting the ones we don't know."""
+    warnings: List[str] = []
+    known = set(style.__dataclass_fields__)  # type: ignore[attr-defined]
+    for key, value in options.items():
+        if value is None:
+            continue
+        if key not in known:
+            warnings.append(f"ignored unknown {label} style option {key!r}")
+            continue
+        try:
+            setattr(style, key, value)
+        except Exception:  # pragma: no cover - dataclass setattr does not validate
+            warnings.append(f"ignored {label} style option {key!r}")
+    return style, warnings
+
+
 def style_from_options(options: Optional[Dict[str, Any]]) -> Tuple[CaptionStyle, List[str]]:
-    """Build a style from a preset name plus per-field overrides.
+    """Build a caption style from a preset name plus per-field overrides.
 
     Returns ``(style, warnings)``; unknown keys are reported rather than
     silently ignored, because a typo'd style key is otherwise invisible until
     someone looks closely at the export.
     """
     options = dict(options or {})
-    warnings: List[str] = []
 
     preset_name = str(options.pop("preset", DEFAULT_PRESET) or DEFAULT_PRESET).lower()
+    warnings: List[str] = []
     if preset_name not in PRESETS:
         warnings.append(
             f"unknown caption preset {preset_name!r} — using {DEFAULT_PRESET!r} "
             f"(available: {', '.join(sorted(PRESETS))})"
         )
         preset_name = DEFAULT_PRESET
-    style = replace(PRESETS[preset_name])
 
-    known = {f for f in style.__dataclass_fields__}  # type: ignore[attr-defined]
-    for key, value in options.items():
-        if value is None:
-            continue
-        if key not in known:
-            warnings.append(f"ignored unknown caption style option {key!r}")
-            continue
+    style, override_warnings = _apply_overrides(
+        replace(PRESETS[preset_name]), options, "caption"
+    )
+    return style.normalized(), warnings + override_warnings
+
+
+def title_overlay_from_options(
+    options: Optional[Dict[str, Any]],
+    *,
+    generated_title: Optional[str] = None,
+    video_duration: Optional[float] = None,
+) -> Tuple[Optional[TitleOverlay], List[str]]:
+    """Build the hook-title overlay, or None when there is nothing to show.
+
+    ``text`` wins; otherwise the first generated title is used, so "make me
+    titles and burn one on" is a single call. ``duration`` shortens the overlay
+    from the start of the video — omitted, it stays up for the whole clip,
+    which is how short-form hooks are normally cut.
+    """
+    if options in (None, False):
+        return None, []
+    if options is True:
+        options = {}
+    options = dict(options or {})
+
+    text = str(options.pop("text", "") or "").strip() or (generated_title or "").strip()
+    if not text:
+        return None, ["no title text to overlay — run the titles stage or pass one"]
+
+    start = max(0.0, float(options.pop("start", 0.0) or 0.0))
+    duration = options.pop("duration", None)
+    end: Optional[float] = None
+    if duration is not None:
         try:
-            setattr(style, key, value)
-        except Exception:  # pragma: no cover - dataclass setattr does not validate
-            warnings.append(f"ignored caption style option {key!r}")
+            end = start + max(0.5, float(duration))
+        except (TypeError, ValueError):
+            return None, [f"ignored unusable title overlay duration {duration!r}"]
+    if video_duration is not None:
+        end = min(end, video_duration) if end is not None else video_duration
+        if start >= (video_duration - 0.1):
+            return None, ["title overlay starts after the video ends — skipped"]
 
-    return style.normalized(), warnings
+    style, warnings = _apply_overrides(replace(TITLE_STYLE), options, "title")
+    return TitleOverlay(text=text, start=start, end=end, style=style.normalized()), warnings
 
 
 # ---------------------------------------------------------------------------
@@ -433,23 +507,8 @@ def format_ass_timestamp(seconds: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def format_ass(
-    cues: Sequence[Any],
-    style: CaptionStyle,
-    *,
-    width: int,
-    height: int,
-    font: Optional[FontChoice] = None,
-) -> str:
-    """Render cues as a styled ASS subtitle document.
-
-    *cues* are :class:`tools.video_pipeline.Cue` instances (anything with
-    ``start`` / ``end`` / ``text``).
-    """
-    style = style.normalized()
-    width = max(16, int(width))
-    height = max(16, int(height))
-
+def _style_line(name: str, style: CaptionStyle, font_family: str, width: int, height: int) -> str:
+    """One ``Style:`` row of the V4+ styles block."""
     font_size = style.font_size or max(12, int(round(height * style.font_scale)))
     outline = (
         style.outline_width
@@ -463,17 +522,59 @@ def format_ass(
     )
     margin_v = int(round(height * style.margin_scale))
     margin_h = int(round(width * 0.06))
-
-    sample = " ".join(getattr(cue, "text", "") for cue in cues)
-    if font is None:
-        font = resolve_font(style.font, sample)
-
     border_style = 3 if style.box else 1
     back_color = (
         hex_to_ass_color(style.box_color, alpha=1.0 - style.box_opacity)
         if style.box
         else hex_to_ass_color("#000000", alpha=0.5)
     )
+    return (
+        f"Style: {name},{font_family},{font_size},"
+        f"{hex_to_ass_color(style.primary_color)},"
+        f"{hex_to_ass_color(style.primary_color)},"
+        f"{hex_to_ass_color(style.outline_color)},"
+        f"{back_color},"
+        f"{-1 if style.bold else 0},0,0,0,100,100,0,0,"
+        f"{border_style},{outline},{shadow},"
+        f"{_ALIGNMENT[style.position]},{margin_h},{margin_h},{margin_v},1"
+    )
+
+
+def _dialogue(start: float, end: float, style_name: str, text: str) -> str:
+    return (
+        f"Dialogue: 0,{format_ass_timestamp(start)},{format_ass_timestamp(end)},"
+        f"{style_name},,0,0,0,,{_escape_ass_text(text)}"
+    )
+
+
+def format_ass(
+    cues: Sequence[Any],
+    style: CaptionStyle,
+    *,
+    width: int,
+    height: int,
+    font: Optional[FontChoice] = None,
+    title: Optional[TitleOverlay] = None,
+    video_duration: Optional[float] = None,
+) -> str:
+    """Render cues (and an optional hook title) as a styled ASS document.
+
+    *cues* are :class:`tools.video_pipeline.Cue` instances (anything with
+    ``start`` / ``end`` / ``text``). The title gets its own style row so it can
+    be repositioned or resized independently of the captions — and so an editor
+    opening the file can restyle one without touching the other.
+    """
+    style = style.normalized()
+    width = max(16, int(width))
+    height = max(16, int(height))
+
+    font_size = style.font_size or max(12, int(round(height * style.font_scale)))
+
+    sample = " ".join(getattr(cue, "text", "") for cue in cues)
+    if title is not None:
+        sample = f"{title.text} {sample}"
+    if font is None:
+        font = resolve_font(style.font, sample)
 
     header = [
         "[Script Info]",
@@ -492,16 +593,11 @@ def format_ass(
             "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
             "Alignment, MarginL, MarginR, MarginV, Encoding"
         ),
-        (
-            f"Style: Default,{font.family},{font_size},"
-            f"{hex_to_ass_color(style.primary_color)},"
-            f"{hex_to_ass_color(style.primary_color)},"
-            f"{hex_to_ass_color(style.outline_color)},"
-            f"{back_color},"
-            f"{-1 if style.bold else 0},0,0,0,100,100,0,0,"
-            f"{border_style},{outline},{shadow},"
-            f"{_ALIGNMENT[style.position]},{margin_h},{margin_h},{margin_v},1"
-        ),
+        _style_line("Default", style, font.family, width, height),
+    ]
+    if title is not None:
+        header.append(_style_line("Title", title.style, font.family, width, height))
+    header += [
         "",
         "[Events]",
         (
@@ -511,6 +607,22 @@ def format_ass(
     ]
 
     events: List[str] = []
+
+    if title is not None:
+        title_style = title.style.normalized()
+        title_size = title_style.font_size or max(
+            12, int(round(height * title_style.font_scale))
+        )
+        text = title.text.upper() if title_style.uppercase else title.text
+        limit = title_style.max_chars_per_line or chars_per_line(text, title_size, width)
+        # A hook title is one on-screen unit — it must not be split into
+        # sequential blocks the way a spoken cue is, so it gets as many lines
+        # as it needs up to its own cap.
+        body = "\\N".join(wrap_lines(text, limit)[: title_style.max_lines])
+        end = title.end if title.end is not None else (video_duration or title.start + 5.0)
+        if end > title.start:
+            events.append(_dialogue(title.start, end, "Title", body))
+
     for cue in cues:
         text = (getattr(cue, "text", "") or "").strip()
         if not text:
@@ -523,10 +635,7 @@ def format_ass(
             float(getattr(cue, "start", 0.0)), float(getattr(cue, "end", 0.0)), blocks
         )
         for block, (start, end) in zip(blocks, spans):
-            events.append(
-                f"Dialogue: 0,{format_ass_timestamp(start)},"
-                f"{format_ass_timestamp(end)},Default,,0,0,0,,{_escape_ass_text(block)}"
-            )
+            events.append(_dialogue(start, end, "Default", block))
 
     return "\n".join(header + events) + "\n"
 

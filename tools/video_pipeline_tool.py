@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from tools.registry import registry, tool_error
 from tools.video_captions import (
     DEFAULT_FONT_SCALE,
+    DEFAULT_TITLE_FONT_SCALE,
     MAX_FONT_SCALE,
     MIN_FONT_SCALE,
     POSITIONS,
@@ -140,6 +141,59 @@ VIDEO_PIPELINE_SCHEMA: Dict[str, Any] = {
                     f"default {DEFAULT_THUMBNAIL_COUNT}). Picks are spread across "
                     "the video so they are not all from one shot."
                 ),
+            },
+            "title_overlay": {
+                "type": "object",
+                "description": (
+                    "Burn a hook title over the video (used by the `burn` "
+                    "stage). Omit for no title. With `text` left out it uses "
+                    "the best candidate from the `titles` stage, so \"title it "
+                    "and burn it on\" is one call."
+                ),
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Title to display. Defaults to the first generated "
+                            "title candidate."
+                        ),
+                    },
+                    "duration": {
+                        "type": "number",
+                        "description": (
+                            "Seconds the title stays up. Omit to keep it on "
+                            "screen for the whole video, which is how "
+                            "short-form hooks are usually cut."
+                        ),
+                    },
+                    "start": {
+                        "type": "number",
+                        "description": "When the title appears (default 0).",
+                    },
+                    "font": {"type": "string", "description": "Font family or file path."},
+                    "font_scale": {
+                        "type": "number",
+                        "description": (
+                            "Title height as a fraction of the video height "
+                            f"(default {DEFAULT_TITLE_FONT_SCALE}) — bigger "
+                            "than the captions by default."
+                        ),
+                    },
+                    "font_size": {"type": "integer", "description": "Absolute size in pixels."},
+                    "primary_color": {"type": "string", "description": "#RRGGBB."},
+                    "outline_color": {"type": "string", "description": "#RRGGBB."},
+                    "position": {
+                        "type": "string",
+                        "enum": list(POSITIONS),
+                        "description": "Default top, so it clears the captions.",
+                    },
+                    "margin_scale": {
+                        "type": "number",
+                        "description": "Distance from that edge, as a fraction of height.",
+                    },
+                    "box": {"type": "boolean", "description": "Translucent plate behind the title."},
+                    "max_lines": {"type": "integer", "description": "Maximum lines, 1-4."},
+                },
             },
             "caption_style": {
                 "type": "object",
@@ -280,6 +334,7 @@ def video_pipeline(
     title_language: Optional[str] = None,
     thumbnail_count: Any = None,
     caption_style: Any = None,
+    title_overlay: Any = None,
 ) -> str:
     """Run the video pipeline and return its JSON result."""
     if not isinstance(video_path, str) or not video_path.strip():
@@ -329,6 +384,7 @@ def video_pipeline(
                 thumbnail_count, DEFAULT_THUMBNAIL_COUNT, 1, MAX_THUMBNAIL_COUNT
             ),
             caption_style=caption_style if isinstance(caption_style, dict) else None,
+            title_overlay=title_overlay if isinstance(title_overlay, (dict, bool)) else None,
         )
     except VideoPipelineError as exc:
         return tool_error(str(exc))
@@ -358,6 +414,7 @@ def _handle_video_pipeline(args: Dict[str, Any], **_kwargs: Any) -> str:
         title_language=args.get("title_language"),
         thumbnail_count=args.get("thumbnail_count"),
         caption_style=args.get("caption_style"),
+        title_overlay=args.get("title_overlay"),
     )
 
 

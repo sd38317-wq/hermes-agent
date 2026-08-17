@@ -77,6 +77,27 @@ You get two files: `subtitles.ass` (the styling in an editable format Premiere a
 
 Sizes are fractions of the height so one style renders the same on a 720x1280 phone export and a 1080x1920 master. A cue whose text does not fit in `max_lines` is split into consecutive on-screen blocks with the time divided between them — folding the overflow into the last line would push text off the side of the frame.
 
+### Hook title
+
+`title_overlay` burns a title over the video — the line a scrolling viewer reads before deciding to stay. Leave `text` out and it uses the best candidate the `titles` stage just wrote, so titling and burning is one call:
+
+```
+제목 뽑아서 그중 제일 좋은 걸로 영상 위에 박아줘
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `text` | first generated title | |
+| `duration` | whole video | Seconds on screen from `start` |
+| `start` | `0` | |
+| `font_scale` | `0.062` | Larger than the captions by default |
+| `position` | `top` | So it clears the bottom captions |
+| `margin_scale` | `0.09` | |
+| `max_lines` | `3` | |
+| `font` / `font_size` / `primary_color` / `outline_color` / `box` | as captions | |
+
+The title gets its own style row in the `.ass`, so it can be repositioned or recoloured without touching the captions — in the file or in an editor. Unlike a spoken cue, a title that does not fit wraps onto more lines rather than splitting into consecutive blocks: it is one unit the viewer reads at a glance.
+
 ### Fonts
 
 **Korean captions need a Korean font.** libass silently substitutes when a family is missing, and the usual result is a wall of tofu boxes discovered after the export. The pipeline checks what is installed before rendering, prefers a Hangul-capable face when the transcript contains Hangul (Pretendard → Noto Sans KR → Noto Sans CJK KR → NanumGothic → the macOS/Windows system faces), and reports what it picked in `captions.font`. A missing requested font is a warning in the result, not a surprise later.

@@ -1227,23 +1227,49 @@ def write_caption_files(
     *,
     width: int,
     height: int,
+    duration: Optional[float] = None,
     style_options: Optional[Dict[str, Any]] = None,
+    title_options: Any = None,
+    generated_title: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """Write a styled ``subtitles.ass`` for *cues*. Returns ``(info, warnings)``.
 
     The ASS file is the styling contract: it is what gets burned in, and it is
-    what an editor opens to reproduce or tweak the look by hand.
+    what an editor opens to reproduce or tweak the look by hand. When a hook
+    title is requested it lands in the same file under its own style, so the
+    burn is still a single pass over the video.
     """
-    from tools.video_captions import format_ass, resolve_font, style_from_options
+    from tools.video_captions import (
+        format_ass,
+        resolve_font,
+        style_from_options,
+        title_overlay_from_options,
+    )
 
     style, warnings = style_from_options(style_options)
-    font = resolve_font(style.font, " ".join(cue.text for cue in cues))
+    title, title_warnings = title_overlay_from_options(
+        title_options, generated_title=generated_title, video_duration=duration
+    )
+    warnings.extend(title_warnings)
+
+    sample = " ".join(cue.text for cue in cues)
+    if title is not None:
+        sample = f"{title.text} {sample}"
+    font = resolve_font(style.font, sample)
     warnings.extend(font.warnings)
 
     ass_path = Path(output_dir) / "subtitles.ass"
     ass_path.parent.mkdir(parents=True, exist_ok=True)
     ass_path.write_text(
-        format_ass(cues, style, width=width, height=height, font=font),
+        format_ass(
+            cues,
+            style,
+            width=width,
+            height=height,
+            font=font,
+            title=title,
+            video_duration=duration,
+        ),
         encoding="utf-8",
     )
 
@@ -1254,6 +1280,15 @@ def write_caption_files(
         "position": style.position,
         "primary_color": style.primary_color,
     }
+    if title is not None:
+        info["title_overlay"] = {
+            "text": title.text,
+            "start": round(title.start, 2),
+            "end": round(title.end, 2) if title.end is not None else None,
+            "position": title.style.position,
+            "font_size": title.style.font_size
+            or max(12, int(round(height * title.style.font_scale))),
+        }
     return info, warnings
 
 
@@ -1327,6 +1362,7 @@ def run_pipeline(
     stt_concurrency: Optional[int] = None,
     subtitle_formats: Sequence[str] = ("srt", "vtt"),
     caption_style: Optional[Dict[str, Any]] = None,
+    title_overlay: Any = None,
     title_count: int = DEFAULT_TITLE_COUNT,
     title_language: Optional[str] = None,
     thumbnail_count: int = DEFAULT_THUMBNAIL_COUNT,
@@ -1435,6 +1471,24 @@ def run_pipeline(
                 result.subtitles = written
                 result.stages.append(STAGE_SUBTITLES)
 
+    # ── titles ───────────────────────────────────────────────────────────
+    if STAGE_TITLES in requested:
+        transcript = join_transcript(cues)
+        if transcript:
+            titles, title_error = generate_titles(
+                transcript,
+                count=title_count,
+                language=title_language,
+                llm=llm,
+            )
+            if titles:
+                result.titles = titles
+                result.stages.append(STAGE_TITLES)
+            if title_error:
+                result.warnings.append(title_error)
+        else:
+            result.warnings.append("skipped titles — no transcript to work from")
+
     # ── styled captions + burn-in ────────────────────────────────────────
     if STAGE_BURN in requested and cues:
         caption_info, caption_warnings = write_caption_files(
@@ -1442,7 +1496,12 @@ def run_pipeline(
             str(target_dir),
             width=int(info.get("width") or 1080),
             height=int(info.get("height") or 1920),
+            duration=duration,
             style_options=caption_style,
+            title_options=title_overlay,
+            # The hook title defaults to the best candidate the titles stage
+            # just produced, so "title it and burn it on" is one call.
+            generated_title=result.titles[0] if result.titles else None,
         )
         result.warnings.extend(caption_warnings)
         if info.get("has_video"):
@@ -1467,24 +1526,6 @@ def run_pipeline(
         result.captions = caption_info
     elif STAGE_BURN in requested:
         result.warnings.append("skipped burn-in — no cues to render")
-
-    # ── titles ───────────────────────────────────────────────────────────
-    if STAGE_TITLES in requested:
-        transcript = join_transcript(cues)
-        if transcript:
-            titles, title_error = generate_titles(
-                transcript,
-                count=title_count,
-                language=title_language,
-                llm=llm,
-            )
-            if titles:
-                result.titles = titles
-                result.stages.append(STAGE_TITLES)
-            if title_error:
-                result.warnings.append(title_error)
-        else:
-            result.warnings.append("skipped titles — no transcript to work from")
 
     # ── thumbnails ───────────────────────────────────────────────────────
     if STAGE_THUMBNAILS in requested:

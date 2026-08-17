@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,7 @@ from tools.video_captions import (
     resolve_font,
     split_cue_duration,
     style_from_options,
+    title_overlay_from_options,
     wrap_lines,
 )
 from tools.video_pipeline import Cue, find_ffmpeg, find_ffprobe, run_pipeline
@@ -292,6 +294,117 @@ def test_dialogue_timings_stay_inside_the_cue():
             assert 4.0 - 0.01 <= seconds <= 9.0 + 0.01
 
 
+# ── hook title overlay ──────────────────────────────────────────────────────
+
+
+def test_no_overlay_is_built_when_none_is_requested():
+    assert title_overlay_from_options(None)[0] is None
+    assert title_overlay_from_options(False)[0] is None
+
+
+def test_overlay_falls_back_to_the_generated_title():
+    """`titles` then `burn` should not need the title repeated by hand."""
+    overlay, warnings = title_overlay_from_options({}, generated_title="버려진 그녀의 귀환")
+    assert overlay is not None
+    assert overlay.text == "버려진 그녀의 귀환"
+    assert warnings == []
+
+
+def test_explicit_text_wins_over_the_generated_title():
+    overlay, _ = title_overlay_from_options(
+        {"text": "직접 쓴 제목"}, generated_title="자동 생성 제목"
+    )
+    assert overlay.text == "직접 쓴 제목"
+
+
+def test_overlay_with_no_text_anywhere_warns():
+    overlay, warnings = title_overlay_from_options({})
+    assert overlay is None
+    assert any("no title text" in w for w in warnings)
+
+
+def test_overlay_runs_the_whole_video_unless_a_duration_is_given():
+    overlay, _ = title_overlay_from_options({"text": "제목"}, video_duration=30.0)
+    assert (overlay.start, overlay.end) == (0.0, 30.0)
+
+    shorter, _ = title_overlay_from_options(
+        {"text": "제목", "duration": 5}, video_duration=30.0
+    )
+    assert shorter.end == 5.0
+
+
+def test_overlay_is_clipped_to_the_end_of_the_video():
+    overlay, _ = title_overlay_from_options(
+        {"text": "제목", "duration": 999}, video_duration=12.0
+    )
+    assert overlay.end == 12.0
+
+
+def test_overlay_starting_past_the_end_is_skipped():
+    overlay, warnings = title_overlay_from_options(
+        {"text": "제목", "start": 40}, video_duration=30.0
+    )
+    assert overlay is None
+    assert any("after the video ends" in w for w in warnings)
+
+
+def test_overlay_defaults_sit_above_the_captions_and_larger():
+    overlay, _ = title_overlay_from_options({"text": "제목"}, video_duration=10.0)
+    caption_style, _ = style_from_options(None)
+    assert overlay.style.position == "top"
+    assert caption_style.position == "bottom"
+    assert overlay.style.font_scale > caption_style.font_scale
+
+
+def test_overlay_style_fields_are_overridable_and_validated():
+    overlay, warnings = title_overlay_from_options(
+        {"text": "제목", "position": "center", "font_scale": 0.09, "glow": True},
+        video_duration=10.0,
+    )
+    assert overlay.style.position == "center"
+    assert overlay.style.font_scale == pytest.approx(0.09)
+    assert any("glow" in w for w in warnings)
+
+
+def test_title_gets_its_own_style_row_so_it_can_be_restyled_alone():
+    overlay, _ = title_overlay_from_options({"text": "버려진 그녀"}, video_duration=10.0)
+    style, _ = style_from_options(None)
+    document = format_ass(
+        [Cue(0, 2, KOREAN)], style, width=720, height=1280,
+        font=FontChoice(family="Test Sans"), title=overlay, video_duration=10.0,
+    )
+    style_names = [l.split(",")[0].removeprefix("Style: ") for l in document.splitlines() if l.startswith("Style:")]
+    assert style_names == ["Default", "Title"]
+    title_line = next(l for l in document.splitlines() if l.startswith("Dialogue:") and ",Title," in l)
+    assert "버려진 그녀" in title_line
+
+
+def test_a_long_title_wraps_but_is_never_split_into_sequential_blocks():
+    """A hook title is one on-screen unit — splitting it in time would hide it."""
+    overlay, _ = title_overlay_from_options(
+        {"text": "모두가 버렸던 그녀가 전쟁의 신으로 돌아와 세상을 뒤집었다"},
+        video_duration=30.0,
+    )
+    style, _ = style_from_options(None)
+    document = format_ass(
+        [], style, width=720, height=1280,
+        font=FontChoice(family="Test Sans"), title=overlay, video_duration=30.0,
+    )
+    title_lines = [l for l in document.splitlines() if ",Title," in l]
+    assert len(title_lines) == 1
+    assert "\\N" in title_lines[0]
+
+
+def test_no_title_means_no_title_style_or_events():
+    style, _ = style_from_options(None)
+    document = format_ass(
+        [Cue(0, 2, KOREAN)], style, width=720, height=1280,
+        font=FontChoice(family="Test Sans"),
+    )
+    assert ",Title," not in document
+    assert "Style: Title" not in document
+
+
 # ── burn command ────────────────────────────────────────────────────────────
 
 
@@ -382,6 +495,42 @@ def test_burned_output_keeps_the_source_dimensions_and_duration(tmp_path):
     assert "width=360" in probe and "height=640" in probe
     duration = float(re.search(r"duration=([\d.]+)", probe).group(1))
     assert duration == pytest.approx(result.video["duration"], abs=0.5)
+
+
+@requires_ffmpeg
+def test_generated_title_is_burned_over_the_captions(tmp_path):
+    """The titles stage feeds the overlay, so one call titles and burns."""
+    ffmpeg = find_ffmpeg()
+    source = tmp_path / "clip.mp4"
+    subprocess.run(
+        [ffmpeg, "-y", "-nostdin",
+         "-f", "lavfi", "-i", "testsrc=size=360x640:rate=15:duration=6",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+         "-pix_fmt", "yuv420p", "-shortest", str(source)],
+        capture_output=True, check=True, timeout=180,
+    )
+
+    class _Response:
+        choices = [type("C", (), {"message": type("M", (), {"content": '{"titles": ["버려진 그녀의 귀환"]}'})()})()]
+
+    result = run_pipeline(
+        str(source),
+        stages=["titles", "burn"],
+        output_dir=str(tmp_path / "out"),
+        cue_seconds=3.0,
+        title_overlay={},
+        transcriber=_fake_transcriber,
+        llm=lambda **_kwargs: _Response(),
+    )
+
+    assert result.titles == ["버려진 그녀의 귀환"]
+    assert result.captions["title_overlay"]["text"] == "버려진 그녀의 귀환"
+    ass_text = (tmp_path / "out" / "subtitles.ass").read_text(encoding="utf-8")
+    assert "Style: Title" in ass_text
+    title_line = next(l for l in ass_text.splitlines() if ",Title," in l)
+    # The title wraps to the frame width, so compare the words, not the string.
+    assert title_line.split(",,")[-1].replace("\\N", " ").split() == "버려진 그녀의 귀환".split()
+    assert Path(result.captions["video"]).stat().st_size > 0
 
 
 @requires_ffmpeg
