@@ -29,6 +29,7 @@ from tools.video_captions import (
     resolve_font,
     split_cue_duration,
     style_from_options,
+    reading_speed_warnings,
     title_overlay_from_options,
     wrap_lines,
 )
@@ -412,6 +413,44 @@ def test_no_title_means_no_title_style_or_events():
     )
     assert ",Title," not in document
     assert "Style: Title" not in document
+
+
+# ── reading speed ───────────────────────────────────────────────────────────
+
+
+def test_a_long_title_in_a_short_flash_is_flagged():
+    """Nothing in the render itself shows the viewer could not finish reading."""
+    warnings = reading_speed_warnings("버려진 그녀가 전쟁의 신으로 돌아왔다", 0.0, 2.0)
+    assert warnings
+    assert "2.0s" in warnings[0]
+
+
+def test_a_short_title_in_the_same_flash_is_fine():
+    assert reading_speed_warnings("잃을 게 없다", 0.0, 2.0) == []
+
+
+def test_latin_script_is_allowed_more_characters_than_cjk():
+    """CJK carries more meaning per character, so it is read more slowly."""
+    latin = "the war goddess returns"
+    korean = "전쟁의 신이 돌아왔다 모두가 그녀를 버렸다"
+    assert reading_speed_warnings(latin, 0.0, 2.0) == []
+    assert reading_speed_warnings(korean, 0.0, 2.0)
+
+
+def test_a_title_held_for_the_whole_video_is_never_flagged():
+    assert reading_speed_warnings("아주 긴 제목이라도 끝까지 걸려 있으면 문제없다", 0.0, None) == []
+
+
+def test_reading_speed_check_survives_degenerate_spans():
+    assert reading_speed_warnings("제목", 5.0, 5.0) == []
+    assert reading_speed_warnings("   ", 0.0, 2.0) == []
+
+
+def test_the_warning_reaches_the_overlay_caller():
+    _overlay, warnings = title_overlay_from_options(
+        {"text": "버려진 그녀가 전쟁의 신으로 돌아왔다", "duration": 2}, video_duration=30.0
+    )
+    assert any("on screen for" in w for w in warnings)
 
 
 # ── burn command ────────────────────────────────────────────────────────────

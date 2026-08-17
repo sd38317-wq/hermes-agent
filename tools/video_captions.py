@@ -252,7 +252,53 @@ def title_overlay_from_options(
             return None, ["title overlay starts after the video ends — skipped"]
 
     style, warnings = _apply_overrides(replace(TITLE_STYLE), options, "title")
-    return TitleOverlay(text=text, start=start, end=end, style=style.normalized()), warnings
+    overlay = TitleOverlay(text=text, start=start, end=end, style=style.normalized())
+    warnings.extend(reading_speed_warnings(text, overlay.start, overlay.end))
+    return overlay, warnings
+
+
+# Comfortable on-screen reading rates. CJK carries more meaning per character,
+# so it is read fewer characters per second than Latin script; both figures are
+# the fast end of the subtitling conventions, since a hook title is short and
+# the viewer is looking straight at it.
+CJK_CHARS_PER_SECOND = 7.0
+LATIN_CHARS_PER_SECOND = 17.0
+# Below this, no title is readable no matter how short.
+MIN_READABLE_SECONDS = 0.8
+
+
+def reading_speed_warnings(
+    text: str, start: float, end: Optional[float]
+) -> List[str]:
+    """Warn when a title is on screen too briefly to be read.
+
+    A two-second flash is a deliberate, common choice — but it only works for a
+    short line, and nothing in the render itself reveals that the viewer could
+    not finish reading. So it is said out loud rather than left to be
+    discovered on the timeline.
+    """
+    if end is None:
+        return []
+    seconds = end - start
+    if seconds <= 0:
+        return []
+
+    stripped = re.sub(r"\s+", "", text)
+    if not stripped:
+        return []
+    cjk = len(_CJK_RE.findall(stripped))
+    rate = (
+        CJK_CHARS_PER_SECOND
+        + (LATIN_CHARS_PER_SECOND - CJK_CHARS_PER_SECOND) * (1 - cjk / len(stripped))
+    )
+    needed = max(MIN_READABLE_SECONDS, len(stripped) / rate)
+    if seconds + 0.05 < needed:
+        return [
+            f"the title is {len(stripped)} characters but only on screen for "
+            f"{seconds:.1f}s — allow about {needed:.1f}s, or shorten it to "
+            f"~{int(seconds * rate)} characters"
+        ]
+    return []
 
 
 # ---------------------------------------------------------------------------

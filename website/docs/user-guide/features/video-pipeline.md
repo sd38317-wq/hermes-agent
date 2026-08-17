@@ -96,6 +96,8 @@ Sizes are fractions of the height so one style renders the same on a 720x1280 ph
 | `max_lines` | `3` | |
 | `font` / `font_size` / `primary_color` / `outline_color` / `box` | as captions | |
 
+A short flash is a common cut — `duration: 2` puts the hook up for the first two seconds and gets out of the way. Whether the viewer can actually *read* it in that time depends on its length, and nothing in the render reveals that they couldn't, so the pipeline checks: a title too long for its screen time comes back as a warning with the length that would fit (Korean and other CJK text is read at roughly 7 characters per second, Latin script at about 17).
+
 The title gets its own style row in the `.ass`, so it can be repositioned or recoloured without touching the captions — in the file or in an editor. Unlike a spoken cue, a title that does not fit wraps onto more lines rather than splitting into consecutive blocks: it is one unit the viewer reads at a glance.
 
 ### Fonts
