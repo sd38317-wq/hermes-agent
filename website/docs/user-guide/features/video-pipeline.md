@@ -45,6 +45,7 @@ The agent calls the tool and gets back the output directory, file paths, the tit
 | `stages` | all four | e.g. `["thumbnails"]` to skip transcription entirely |
 | `output_dir` | per-video folder under the Hermes home | |
 | `cue_seconds` | `8` | Target subtitle cue length, 2–30 |
+| `clean_captions` | `true` | Fix recognizer spacing/mishearings — see below |
 | `subtitle_formats` | `["srt", "vtt"]` | |
 | `title_count` | `5` | 1–12 |
 | `title_language` | transcript language | e.g. `"Korean"` |
@@ -119,6 +120,25 @@ Hermes' speech-to-text layer is provider-agnostic and returns text, not timestam
 4. Silence-only stretches are never sent, which saves requests and avoids the empty-audio hallucinations whisper-family models are prone to.
 
 **This means one speech-to-text request per cue.** A 10-minute talking-head video at the default `cue_seconds: 8` is roughly 60–75 requests. Local faster-whisper makes that free; on a paid API, raise `cue_seconds` to 20–30 to cut the request count by 3x, at the cost of longer lines on screen. Local backends are transcribed one window at a time (they share a single model instance); cloud backends run a couple of windows in parallel.
+
+## Fixing what the recognizer got wrong
+
+Speech recognizers hand back text that is heard correctly but written badly. Korean models routinely return whole utterances with **no spacing at all** (`고민을내려놓고칼을들어`), every model mishears words a reader would get from context (`호미를` → `고민을`), and punctuation lands wherever the acoustic model felt a pause. Burned into a video, all three read as sloppiness.
+
+The `caption_cleanup` auxiliary model corrects the cues before they are written, so the `.srt`, the burn and the titles all get the corrected text:
+
+```
+고민을내려놓고칼을들어       →  호미를 내려놓고 칼을 들어.
+잃을게없는여자들이세상을뒤집으로간다  →  잃을 게 없는 여자들이 세상을 뒤집으러 간다.
+```
+
+An unvalidated LLM pass over subtitles is dangerous — it will occasionally invent a line, and a fabricated subtitle burned into a video is worse than a missing space. So the pass may only rewrite, never restructure:
+
+- corrections come back keyed by cue index and are matched back one by one; a cue the model drops keeps its original text,
+- a correction that changes more than its **edit budget** is rejected as a hallucination and the original is kept (the budget is absolute — 3 characters minimum so a short cue's one misheard word can still be fixed, 8 maximum so a long cue cannot be quietly rewritten wholesale),
+- an unconfigured or failing model leaves every cue exactly as it was, with a warning.
+
+Cues go out in batches of 40, so one bad batch cannot cost the whole transcript. The number of corrected cues comes back as `subtitles.cleaned_cues`. Set `clean_captions: false` to keep the raw recognizer output.
 
 ## How thumbnails are picked
 

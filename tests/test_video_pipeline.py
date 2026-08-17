@@ -14,6 +14,7 @@ Three layers:
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -630,6 +631,58 @@ def test_subtitle_cue_times_stay_within_the_video(tmp_path):
             hours, minutes, rest = stamp.split(":")
             seconds = float(rest.replace(",", "."))
             assert int(hours) * 3600 + int(minutes) * 60 + seconds <= duration + 0.05
+
+
+@requires_ffmpeg
+def test_cleaned_text_is_what_reaches_the_subtitle_files(tmp_path):
+    """The correction has to land before the cues are written, not after."""
+    class _Response:
+        def __init__(self, content):
+            self.choices = [type("C", (), {"message": type("M", (), {"content": content})()})()]
+
+    def _cleanup_llm(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"].split("\n\n", 1)[1])
+        fixed = [{"i": c["i"], "t": "띄어쓰기 된 문장"} for c in payload["cues"]]
+        return _Response(json.dumps({"cues": fixed}, ensure_ascii=False))
+
+    def _spaceless(path, model=None):
+        return {"success": True, "transcript": "띄어쓰기없는문장", "provider": "fake"}
+
+    video = _make_video(tmp_path / "clip.mp4")
+    result = run_pipeline(
+        str(video),
+        stages=["subtitles"],
+        output_dir=str(tmp_path / "out"),
+        cue_seconds=3.0,
+        transcriber=_spaceless,
+        llm=_cleanup_llm,
+    )
+    assert result.cleaned_cues > 0
+    srt = Path(result.subtitles["srt"]).read_text(encoding="utf-8")
+    assert "띄어쓰기 된 문장" in srt
+    assert "띄어쓰기없는문장" not in srt
+
+
+@requires_ffmpeg
+def test_cleanup_can_be_turned_off(tmp_path):
+    def _explode(**_kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("the cleanup model ran with clean_captions=False")
+
+    def _spaceless(path, model=None):
+        return {"success": True, "transcript": "띄어쓰기없는문장", "provider": "fake"}
+
+    video = _make_video(tmp_path / "clip.mp4")
+    result = run_pipeline(
+        str(video),
+        stages=["subtitles"],
+        output_dir=str(tmp_path / "out"),
+        cue_seconds=3.0,
+        clean_captions=False,
+        transcriber=_spaceless,
+        llm=_explode,
+    )
+    assert result.cleaned_cues == 0
+    assert "띄어쓰기없는문장" in Path(result.subtitles["srt"]).read_text(encoding="utf-8")
 
 
 @requires_ffmpeg

@@ -3600,6 +3600,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
     ("tts_audio_tags", "TTS audio tags", "Gemini TTS tag insertion"),
     ("video_titles", "Video titles", "video pipeline title candidates"),
+    ("caption_cleanup", "Caption cleanup", "video subtitle spacing/typo fixes"),
     ("skills_hub", "Skills hub", "skills search/install"),
     ("triage_specifier", "Triage specifier", "kanban spec fleshing"),
     ("kanban_decomposer", "Kanban decomposer", "task decomposition"),

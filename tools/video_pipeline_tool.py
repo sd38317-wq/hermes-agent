@@ -115,6 +115,17 @@ VIDEO_PIPELINE_SCHEMA: Dict[str, Any] = {
                     "proportionally fewer speech-to-text requests."
                 ),
             },
+            "clean_captions": {
+                "type": "boolean",
+                "description": (
+                    "Correct the recognizer's spacing, misheard words and "
+                    "punctuation with the `caption_cleanup` auxiliary model "
+                    "before writing the cues (default true). Corrections are "
+                    "matched cue by cue and rejected if they drift from what "
+                    "was heard, so timings never move and nothing is invented. "
+                    "Set false to keep the raw transcript."
+                ),
+            },
             "subtitle_formats": {
                 "type": "array",
                 "items": {"type": "string", "enum": list(SUBTITLE_FORMATS)},
@@ -335,6 +346,7 @@ def video_pipeline(
     thumbnail_count: Any = None,
     caption_style: Any = None,
     title_overlay: Any = None,
+    clean_captions: Any = None,
 ) -> str:
     """Run the video pipeline and return its JSON result."""
     if not isinstance(video_path, str) or not video_path.strip():
@@ -378,6 +390,7 @@ def video_pipeline(
             output_dir=output_dir,
             cue_seconds=_coerce_float(cue_seconds, DEFAULT_CUE_SECONDS, MIN_CUE_SECONDS, MAX_CUE_SECONDS),
             subtitle_formats=formats,
+            clean_captions=clean_captions is not False,
             title_count=_coerce_int(title_count, DEFAULT_TITLE_COUNT, 1, MAX_TITLE_COUNT),
             title_language=(title_language or "").strip() or None,
             thumbnail_count=_coerce_int(
@@ -415,6 +428,7 @@ def _handle_video_pipeline(args: Dict[str, Any], **_kwargs: Any) -> str:
         thumbnail_count=args.get("thumbnail_count"),
         caption_style=args.get("caption_style"),
         title_overlay=args.get("title_overlay"),
+        clean_captions=args.get("clean_captions"),
     )
 
 

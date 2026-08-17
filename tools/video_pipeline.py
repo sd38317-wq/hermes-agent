@@ -212,6 +212,7 @@ class PipelineResult:
     subtitles: Dict[str, Any] = field(default_factory=dict)
     captions: Dict[str, Any] = field(default_factory=dict)
     titles: List[str] = field(default_factory=list)
+    cleaned_cues: int = 0
     thumbnails: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -231,7 +232,9 @@ class PipelineResult:
                 "preview": self.transcript_preview,
             }
         if self.subtitles:
-            payload["subtitles"] = self.subtitles
+            payload["subtitles"] = dict(self.subtitles)
+            if self.cleaned_cues:
+                payload["subtitles"]["cleaned_cues"] = self.cleaned_cues
         if self.captions:
             payload["captions"] = self.captions
         if self.titles:
@@ -1423,6 +1426,7 @@ def run_pipeline(
     stt_model: Optional[str] = None,
     stt_concurrency: Optional[int] = None,
     subtitle_formats: Sequence[str] = ("srt", "vtt"),
+    clean_captions: bool = True,
     caption_style: Optional[Dict[str, Any]] = None,
     title_overlay: Any = None,
     title_count: int = DEFAULT_TITLE_COUNT,
@@ -1507,6 +1511,23 @@ def run_pipeline(
             transcriber=transcriber,
         )
         result.warnings.extend(cue_warnings)
+
+        # Recognizer output is heard right but written badly — no spacing from
+        # Korean models, words misheard that context disambiguates. Correcting
+        # it before the cues are written means the .srt, the burn and the
+        # titles all get the corrected text.
+        if clean_captions and cues:
+            from tools.video_caption_cleanup import clean_cue_texts
+
+            cleaned, clean_warnings, changed = clean_cue_texts(
+                [cue.text for cue in cues], language=title_language, llm=llm
+            )
+            for cue, text in zip(cues, cleaned):
+                cue.text = text
+            result.warnings.extend(clean_warnings)
+            if changed:
+                logger.info("caption cleanup corrected %d of %d cues", changed, len(cues))
+                result.cleaned_cues = changed
 
         transcript = join_transcript(cues)
         if transcript:

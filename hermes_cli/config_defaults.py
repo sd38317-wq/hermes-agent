@@ -1014,6 +1014,18 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Caption cleanup — fixes recognizer spacing/mishearings in video
+        # subtitles before they are written or burned in. One short call per
+        # ~40 cues; a cheap fast model is plenty.
+        "caption_cleanup": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 90,
+            "extra_body": {},
+            "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
         # Video titles — drafts hook-style title candidates from a video
         # transcript for the ``video_pipeline`` tool. One short call per run;
         # a cheap, fast model is plenty.

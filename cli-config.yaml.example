@@ -679,6 +679,12 @@ prompt_caching:
 #     model: ""
 #     timeout: 60
 #
+#   # Fixes speech-recognition spacing and misheard words in video subtitles
+#   caption_cleanup:
+#     provider: "auto"
+#     model: ""
+#     timeout: 90
+#
 #   # Session search — summarizes matching past sessions
 #   session_search:
 #     provider: "auto"
