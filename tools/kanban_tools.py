@@ -772,6 +772,21 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
+            except kb.StaleArtifactsError as stale_err:
+                # Structured rejection — the declared file existed before
+                # this card did, so it cannot be this card's deliverable.
+                # Task state was NOT mutated (the gate runs before the
+                # write txn); spell out the retry path so the worker
+                # doesn't treat this as terminal (see #22923).
+                return tool_error(
+                    f"kanban_complete blocked: these artifacts predate this "
+                    f"card's creation and cannot be its deliverable: "
+                    f"{', '.join(stale_err.stale)}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"Produce the deliverable required by THIS card as a "
+                    f"new file, then retry kanban_complete with the new "
+                    f"path — do not re-submit a pre-existing file."
+                )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "

@@ -59,6 +59,54 @@ def test_low_cost_retry_settings_are_explicitly_opt_in():
     assert kanban["retry_reasoning_effort"] == "low"
 
 
+def test_crash_reclaim_does_not_select_cheap_retry_model(
+    isolated_kanban, monkeypatch
+):
+    """Incident t_de97965e: a worker that died instantly (auth failure) was
+    reclaimed by ``detect_crashed_workers`` (``pid not alive``, exit kind
+    unknown) and the very next dispatch tick downgraded the retry to the
+    cheap ``retry_model``. A crash says nothing about model capability —
+    the cheap retry must not be selected after a crashed outcome."""
+    kb = isolated_kanban
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    seen = []
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="crash then retry", assignee="default")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        # Dead PID that was never reaped by us (init reaped it) — the
+        # incident's ``unknown`` exit kind.
+        kb._set_worker_pid(conn, task_id, 106430)
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert task_id in crashed
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda t, workspace: seen.append(
+                (t.model_override, t.provider_override)
+            ) or 12345,
+            retry_model="gpt-5.4-mini",
+            retry_provider="openai-codex",
+        )
+        event_kinds = {
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        }
+
+    assert len(result.spawned) == 1
+    assert seen == [(None, None)]
+    assert "retry_model_selected" not in event_kinds
+
+
 def test_dispatch_entry_points_inherit_retry_settings_from_config(
     isolated_kanban, monkeypatch
 ):

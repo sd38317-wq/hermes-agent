@@ -5577,6 +5577,27 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class StaleArtifactsError(ValueError):
+    """Raised by ``complete_task`` when a declared completion artifact
+    predates the card itself (file mtime older than ``tasks.created_at``).
+
+    A deliverable produced *for* a card cannot be older than the card; an
+    older file is a pre-existing file being re-submitted as the result
+    (incident t_de97965e: a retry "completed" a render card by attaching
+    the previous day's output). The stale paths are attached as ``.stale``
+    for structured access. Kept as ``ValueError`` subclass so existing
+    tool-error handlers treat it as a recoverable user error.
+    """
+
+    def __init__(self, stale: list[str], task_id: str):
+        self.stale = list(stale)
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: declared artifacts predate this card's "
+            f"creation and cannot be its deliverable: {', '.join(stale)}"
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5660,6 +5681,26 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Gate: a declared artifact older than the card is a pre-existing file
+    # being passed off as the deliverable, not the deliverable. Same shape
+    # as the created_cards gate above — audit event in a tiny txn, then
+    # raise without mutating task state so the worker can retry with a
+    # freshly produced file.
+    stale_artifacts = _stale_completion_artifacts(conn, task_id, metadata)
+    if stale_artifacts:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_stale_artifacts",
+                {
+                    "stale_artifacts": stale_artifacts,
+                    "summary_preview": (
+                        (summary or result or "").strip().splitlines()[0][:200]
+                        if (summary or result)
+                        else None
+                    ),
+                },
+            )
+        raise StaleArtifactsError(stale_artifacts, task_id)
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5874,6 +5915,46 @@ def _merge_completion_prose_artifacts(
             seen.add(path)
     updated["artifacts"] = merged
     return updated
+
+
+def _stale_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> list[str]:
+    """Return declared artifact paths whose mtime predates the card.
+
+    Only readable regular files are considered — missing or unreadable
+    paths are left to the existing preservation / notifier handling.
+    ``created_at`` is stored as ``int(time.time())`` (truncated), so a file
+    written in the same second as card creation compares fresh.
+    """
+    if not isinstance(metadata, dict):
+        return []
+    raw_artifacts = metadata.get("artifacts")
+    if not isinstance(raw_artifacts, (list, tuple)):
+        return []
+    row = conn.execute(
+        "SELECT created_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["created_at"] is None:
+        return []
+    created_at = int(row["created_at"])
+    stale: list[str] = []
+    for item in raw_artifacts:
+        artifact = str(item).strip() if isinstance(item, str) else ""
+        if not artifact:
+            continue
+        src = Path(artifact).expanduser()
+        try:
+            if not src.is_file():
+                continue
+            mtime = src.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < created_at:
+            stale.append(artifact)
+    return stale
 
 
 def _persist_scratch_completion_artifacts(
@@ -9773,6 +9854,27 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def _latest_run_crashed(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the task's most recent ended run crashed.
+
+    Used by the low-cost-retry selection in ``_dispatch_once_locked``: the
+    cheap ``retry_model`` exists to give a *failed attempt* (timeout, spawn
+    failure) one inexpensive second chance. A crash reclaim — a dead PID
+    noticed by ``detect_crashed_workers``, e.g. an auth-revoked worker that
+    died at startup — says nothing about model capability, and downgrading
+    the retry after one produced a false completion (incident t_de97965e:
+    the cheap retry "completed" a render card by attaching a stale file).
+    After a crash, retry on the card's normal model.
+    """
+    row = conn.execute(
+        "SELECT outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None and row["outcome"] == "crashed"
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10162,6 +10264,7 @@ def _dispatch_once_locked(
             claimed.consecutive_failures == 1
             and retry_model
             and not claimed.model_override
+            and not _latest_run_crashed(conn, claimed.id)
         ):
             # One deliberately cheap retry after the first failed attempt.
             # These overrides live only on the detached Task passed to the
