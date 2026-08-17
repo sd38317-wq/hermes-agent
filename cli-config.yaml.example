@@ -672,6 +672,13 @@ prompt_caching:
 #     timeout: 30
 #     language: ""           # empty = match the user's language; or e.g. "English"
 #
+#   # Hook-style video title candidates drafted from a transcript by the
+#   # `video_pipeline` tool (toolset: video_pipeline, needs ffmpeg installed)
+#   video_titles:
+#     provider: "auto"
+#     model: ""
+#     timeout: 60
+#
 #   # Session search — summarizes matching past sessions
 #   session_search:
 #     provider: "auto"
