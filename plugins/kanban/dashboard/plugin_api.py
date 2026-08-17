@@ -237,10 +237,13 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
 # Hallucination-warning event kinds — see complete_task() in kanban_db.py.
 # completion_blocked_hallucination: kernel rejected created_cards with
 #   phantom ids; task stays in prior state.
+# completion_blocked_stale_artifacts: kernel rejected artifacts whose
+#   mtime predates the card (pre-existing file passed off as deliverable).
 # suspected_hallucinated_references: prose scan found t_<hex> in summary
 #   that doesn't resolve; completion succeeded, advisory only.
 _WARNING_EVENT_KINDS = (
     "completion_blocked_hallucination",
+    "completion_blocked_stale_artifacts",
     "suspected_hallucinated_references",
 )
 
