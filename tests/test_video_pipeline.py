@@ -21,6 +21,7 @@ import pytest
 
 from tools.video_pipeline import (
     ALL_STAGES,
+    adaptive_noise_floor,
     SCORE_FRAME_SIZE,
     Cue,
     FrameScore,
@@ -28,12 +29,14 @@ from tools.video_pipeline import (
     build_title_input,
     candidate_times,
     default_output_dir,
+    detect_silences,
     find_ffmpeg,
     find_ffprobe,
     format_srt,
     format_timestamp,
     format_vtt,
     join_transcript,
+    measure_mean_volume,
     parse_silence_log,
     parse_title_response,
     plan_cue_windows,
@@ -76,6 +79,95 @@ def test_parse_silence_log_ignores_unrelated_output():
 def test_silence_end_beyond_duration_is_clamped():
     log = "silence_start: 4.0\nsilence_end: 99.0 | silence_duration: 95.0\n"
     assert parse_silence_log(log, duration=5.0) == [(4.0, 5.0)]
+
+
+# ── silence threshold ───────────────────────────────────────────────────────
+
+
+def test_adaptive_floor_tracks_the_material_level():
+    """Quiet material needs a lower floor; loud material needs a higher one."""
+    assert adaptive_noise_floor(-48.0) < adaptive_noise_floor(-22.0)
+    assert adaptive_noise_floor(-22.0) == -34
+
+
+def test_adaptive_floor_is_clamped_to_a_workable_range():
+    assert -60 <= adaptive_noise_floor(-95.0) <= -25
+    assert -60 <= adaptive_noise_floor(-2.0) <= -25
+
+
+def test_adaptive_floor_falls_back_when_the_level_is_unmeasurable():
+    from tools.video_pipeline import SILENCE_NOISE_DB
+
+    assert adaptive_noise_floor(None) == SILENCE_NOISE_DB
+
+
+@requires_ffmpeg
+def test_quiet_audio_yields_the_same_cues_as_loud_audio(tmp_path):
+    """Regression: a fixed -32 dB floor read a quiet recording as mostly silence,
+    dropping 60% of the dialogue out of the subtitles."""
+    ffmpeg = find_ffmpeg()
+
+    def _bursts(path: Path, gain_db: int) -> Path:
+        # Three 3-second tones separated by one second of true silence.
+        parts = []
+        for index in range(3):
+            part = tmp_path / f"tone-{gain_db}-{index}.wav"
+            subprocess.run(
+                [ffmpeg, "-y", "-nostdin", "-f", "lavfi",
+                 "-i", f"sine=frequency={300 + index * 60}:duration=3",
+                 "-af", f"volume={gain_db}dB", "-ar", "16000", "-ac", "1", str(part)],
+                capture_output=True, check=True, timeout=120,
+            )
+            parts.append(part)
+        gap = tmp_path / "gap.wav"
+        subprocess.run(
+            [ffmpeg, "-y", "-nostdin", "-f", "lavfi",
+             "-i", "anullsrc=r=16000:cl=mono", "-t", "1", "-ar", "16000", str(gap)],
+            capture_output=True, check=True, timeout=120,
+        )
+        listing = tmp_path / f"list-{gain_db}.txt"
+        order = [gap, parts[0], gap, parts[1], gap, parts[2], gap]
+        listing.write_text("".join(f"file '{p}'\n" for p in order), encoding="utf-8")
+        subprocess.run(
+            [ffmpeg, "-y", "-nostdin", "-f", "concat", "-safe", "0",
+             "-i", str(listing), "-c", "copy", str(path)],
+            capture_output=True, check=True, timeout=120,
+        )
+        return path
+
+    duration = 13.0
+    loud = _bursts(tmp_path / "loud.wav", 0)
+    quiet = _bursts(tmp_path / "quiet.wav", -25)
+
+    def _plan(path):
+        return plan_cue_windows(duration, detect_silences(str(path), duration), cue_seconds=8.0)
+
+    loud_windows, quiet_windows = _plan(loud), _plan(quiet)
+    assert len(quiet_windows) == len(loud_windows) == 3
+    loud_covered = sum(end - start for start, end in loud_windows)
+    quiet_covered = sum(end - start for start, end in quiet_windows)
+    assert quiet_covered == pytest.approx(loud_covered, abs=0.3)
+
+
+@requires_ffmpeg
+def test_mean_volume_tracks_the_attenuation_applied(tmp_path):
+    """The measurement has to move with the material, not just return a number."""
+    ffmpeg = find_ffmpeg()
+
+    def _tone(name: str, gain_db: int) -> str:
+        path = tmp_path / name
+        subprocess.run(
+            [ffmpeg, "-y", "-nostdin", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+             "-af", f"volume={gain_db}dB", "-ar", "16000", "-ac", "1", str(path)],
+            capture_output=True, check=True, timeout=120,
+        )
+        return str(path)
+
+    loud = measure_mean_volume(_tone("loud.wav", 0), 2.0)
+    quiet = measure_mean_volume(_tone("quiet.wav", -20), 2.0)
+    assert loud is not None and quiet is not None
+    assert quiet == pytest.approx(loud - 20, abs=1.0)
+    assert adaptive_noise_floor(quiet) < adaptive_noise_floor(loud)
 
 
 # ── speech regions ──────────────────────────────────────────────────────────

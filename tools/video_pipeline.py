@@ -89,7 +89,16 @@ CUE_PAD_SECONDS = 0.12
 # Two cues separated by less than this and short enough to merge become one.
 CUE_MERGE_GAP_SECONDS = 0.6
 
+# Silence threshold. A fixed absolute floor mis-reads quiet material: a phone
+# recording averaging -48 dB sits entirely under a -32 dB floor, so most of the
+# dialogue is classified as silence and never transcribed (measured: 12.7s of
+# speech covered dropped to 5.0s on the same audio attenuated by 25 dB). The
+# floor is therefore derived from the material's own mean level, and the fixed
+# value is only the fallback for when the measurement fails.
 SILENCE_NOISE_DB = -32
+SILENCE_FLOOR_OFFSET_DB = 12
+SILENCE_FLOOR_MIN_DB = -60
+SILENCE_FLOOR_MAX_DB = -25
 DEFAULT_STT_CONCURRENCY = 2
 MAX_STT_CONCURRENCY = 8
 # Above this many cue windows the run is worth flagging: one request each adds
@@ -423,6 +432,36 @@ def extract_audio(
 
 _SILENCE_START_RE = re.compile(r"silence_start:\s*(-?[\d.]+)")
 _SILENCE_END_RE = re.compile(r"silence_end:\s*(-?[\d.]+)")
+_MEAN_VOLUME_RE = re.compile(r"mean_volume:\s*(-?[\d.]+)\s*dB")
+
+
+def measure_mean_volume(
+    audio_path: str, duration: float, *, ffmpeg: Optional[str] = None
+) -> Optional[float]:
+    """Return the track's mean level in dBFS, or None when it can't be measured."""
+    ffmpeg = ffmpeg or find_ffmpeg()
+    if not ffmpeg:
+        return None
+    proc = _run(
+        [ffmpeg, "-nostdin", "-i", audio_path, "-af", "volumedetect", "-f", "null", "-"],
+        timeout=_ffmpeg_timeout(duration),
+    )
+    match = _MEAN_VOLUME_RE.search(proc.stderr or "")
+    return _coerce_float(match.group(1)) if match else None
+
+
+def adaptive_noise_floor(mean_db: Optional[float]) -> int:
+    """Pick a silence threshold relative to the material's own mean level.
+
+    Quiet material needs a lower floor or its dialogue reads as silence; loud,
+    compressed material needs a higher one or its room tone reads as speech.
+    The clamps keep the derived value inside the range where ``silencedetect``
+    behaves, and an unmeasurable track falls back to the fixed default.
+    """
+    if mean_db is None:
+        return SILENCE_NOISE_DB
+    floor = mean_db - SILENCE_FLOOR_OFFSET_DB
+    return int(round(max(SILENCE_FLOOR_MIN_DB, min(SILENCE_FLOOR_MAX_DB, floor))))
 
 
 def detect_silences(
@@ -430,10 +469,13 @@ def detect_silences(
     duration: float,
     *,
     ffmpeg: Optional[str] = None,
-    noise_db: int = SILENCE_NOISE_DB,
+    noise_db: Optional[int] = None,
     min_silence: float = MIN_SILENCE_SECONDS,
 ) -> List[Tuple[float, float]]:
     """Return ``[(start, end)]`` silence spans, or ``[]`` when detection fails.
+
+    ``noise_db`` defaults to a floor derived from the track's own mean level
+    (see :func:`adaptive_noise_floor`); pass a value to pin it.
 
     Failure is not fatal: with no silence map the window planner falls back to
     fixed-length cuts, which is worse for phrasing but still produces valid
@@ -442,6 +484,11 @@ def detect_silences(
     ffmpeg = ffmpeg or find_ffmpeg()
     if not ffmpeg:
         return []
+    if noise_db is None:
+        noise_db = adaptive_noise_floor(
+            measure_mean_volume(audio_path, duration, ffmpeg=ffmpeg)
+        )
+        logger.debug("silence floor for %s: %d dB", audio_path, noise_db)
     proc = _run(
         [
             ffmpeg, "-nostdin",

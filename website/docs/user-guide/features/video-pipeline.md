@@ -51,7 +51,7 @@ The agent calls the tool and gets back the output directory, file paths, the tit
 
 Hermes' speech-to-text layer is provider-agnostic and returns text, not timestamps — every backend can fill that contract, including ones that ship later. So the pipeline gets its timing from the cut instead of from the provider:
 
-1. `silencedetect` maps the pauses in the extracted audio.
+1. `silencedetect` maps the pauses in the extracted audio. Its threshold is derived from the track's own mean level rather than fixed, so a quietly-recorded video does not read as one long silence — measured on the same audio attenuated by 25 dB, a fixed floor dropped speech coverage from 12.7s to 5.0s; the adaptive floor gives an identical cue plan at both levels.
 2. Speech is split into cue-sized windows **at those pauses**, so cues break on phrase boundaries.
 3. Each window is transcribed on its own. The cue's start and end are the window's — exact by construction.
 4. Silence-only stretches are never sent, which saves requests and avoids the empty-audio hallucinations whisper-family models are prone to.
