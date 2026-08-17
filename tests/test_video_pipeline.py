@@ -46,6 +46,7 @@ from tools.video_pipeline import (
     score_frame,
     select_thumbnail_times,
     speech_regions,
+    strip_overlap,
 )
 
 HAS_FFMPEG = bool(find_ffmpeg() and find_ffprobe())
@@ -242,6 +243,38 @@ def test_short_neighbouring_phrases_are_merged_into_one_cue():
 
 def test_cue_windows_are_empty_for_silent_audio():
     assert plan_cue_windows(10.0, [(0.0, 10.0)], cue_seconds=5.0) == []
+
+
+# ── boundary overlap ────────────────────────────────────────────────────────
+
+
+def test_overlap_repeated_at_a_join_is_trimmed():
+    """Cue slices overlap so boundary words survive; the second copy must go."""
+    assert strip_overlap("나와함께싸울거야?", "싸울거야? 184년") == "184년"
+
+
+def test_overlap_trimming_ignores_spacing_and_punctuation():
+    """Recognizers place spaces and periods inconsistently between runs."""
+    assert strip_overlap("we fight together", "together, in 184") == "in 184"
+
+
+def test_unrelated_neighbours_are_left_alone():
+    assert strip_overlap("굶어죽을거야?", "내가바로장각이다") == "내가바로장각이다"
+
+
+def test_a_single_repeated_character_is_not_treated_as_overlap():
+    """One shared syllable is a coincidence, not a duplicated word."""
+    assert strip_overlap("칼을들어", "어머니가돌아왔다") == "어머니가돌아왔다"
+
+
+def test_a_genuine_repetition_longer_than_the_window_survives():
+    previous = "빨리 가자 가자 가자 지금 당장 움직여야 한다 서둘러"
+    assert strip_overlap(previous, "우리는 이미 늦었다") == "우리는 이미 늦었다"
+
+
+def test_overlap_trimming_handles_empty_sides():
+    assert strip_overlap("", "첫 큐입니다") == "첫 큐입니다"
+    assert strip_overlap("이전 큐", "") == ""
 
 
 # ── subtitle formatting ─────────────────────────────────────────────────────

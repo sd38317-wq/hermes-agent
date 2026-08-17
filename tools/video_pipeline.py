@@ -90,6 +90,19 @@ MIN_SPEECH_SECONDS = 0.35
 MIN_SILENCE_SECONDS = 0.30
 # Cue windows are padded outward so consonants at the edges aren't clipped.
 CUE_PAD_SECONDS = 0.12
+# Extra audio handed to the recognizer beyond each cue's own bounds. Where a
+# cue boundary is a hard cut rather than a pause — continuous narration, a
+# music bed, anything the silence map could not split — the cut lands mid-word
+# and the recognizer sees half a syllable at each edge, so the word is lost
+# from both neighbours. Measured on a music-bedded clip: "호미를 내려놓고 칼을
+# 들어" came back as "내려놓고 가을 들어". The slice is widened for recognition
+# only; the cue keeps its own timing, and the duplicate words this introduces
+# at the joins are trimmed by :func:`strip_overlap`.
+CUE_CONTEXT_SECONDS = 0.45
+# Longest run of repeated characters trimmed from the head of a cue. Long
+# enough for a word that straddled a boundary, short enough that a genuine
+# repetition ("가자 가자") survives.
+MAX_OVERLAP_TRIM_CHARS = 14
 # Two cues separated by less than this and short enough to merge become one.
 CUE_MERGE_GAP_SECONDS = 0.6
 
@@ -650,6 +663,41 @@ def _slice_audio(
     return True
 
 
+_TRIM_IGNORE_RE = re.compile(r"[\s.,!?…·'\"“”‘’-]+")
+
+
+def strip_overlap(previous: str, current: str, *, max_chars: int = MAX_OVERLAP_TRIM_CHARS) -> str:
+    """Drop the head of *current* that repeats the tail of *previous*.
+
+    Cue slices are widened for recognition, so a word sitting on a boundary is
+    transcribed into both neighbours. This removes the second copy. Comparison
+    ignores spacing and punctuation because recognizers place both
+    inconsistently — Korean models in particular emit text with no spaces at
+    all — and the longest match wins so a whole repeated word goes rather than
+    one syllable of it.
+    """
+    if not previous or not current:
+        return current
+
+    def _norm(text: str) -> Tuple[str, List[int]]:
+        """Comparable text plus the original index of each kept character."""
+        kept, positions = [], []
+        for index, char in enumerate(text):
+            if not _TRIM_IGNORE_RE.match(char):
+                kept.append(char)
+                positions.append(index)
+        return "".join(kept), positions
+
+    tail, _ = _norm(previous[-max_chars * 2:])
+    head, head_positions = _norm(current[: max_chars * 2])
+    limit = min(max_chars, len(tail), len(head))
+    for length in range(limit, 1, -1):
+        if tail[-length:] == head[:length]:
+            cut = head_positions[length - 1] + 1
+            return current[cut:].lstrip(" .,!?…·")
+    return current
+
+
 def _resolve_stt_concurrency(requested: Optional[int]) -> int:
     """Clamp the requested worker count, forcing 1 for local STT backends.
 
@@ -680,6 +728,7 @@ def transcribe_windows(
     *,
     model: Optional[str] = None,
     concurrency: Optional[int] = None,
+    context: float = CUE_CONTEXT_SECONDS,
     ffmpeg: Optional[str] = None,
     transcriber=None,
 ) -> Tuple[List[Cue], List[str]]:
@@ -709,8 +758,13 @@ def transcribe_windows(
     try:
         def _one(index: int) -> Optional[str]:
             start, end = windows[index]
+            # Recognize with a little of the neighbouring audio so a word that
+            # straddles the boundary is heard whole; the cue keeps its own
+            # timing and the repeated text is trimmed after the fact.
+            slice_start = max(0.0, start - context)
+            slice_end = end + context
             slice_path = os.path.join(work_dir, f"cue-{index:05d}.wav")
-            if not _slice_audio(ffmpeg, audio_path, start, end, slice_path):
+            if not _slice_audio(ffmpeg, audio_path, slice_start, slice_end, slice_path):
                 return f"cue {index + 1} could not be cut from the audio"
             try:
                 try:
@@ -741,6 +795,14 @@ def transcribe_windows(
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    # Trim the text each cue inherited from its neighbour's context window.
+    previous_text = ""
+    for cue in results:
+        if cue is None:
+            continue
+        cue.text = strip_overlap(previous_text, cue.text)
+        previous_text = cue.text or previous_text
+
     failures = [p for p in problems if p]
     if failures:
         # Keep the tool result bounded: report the first few verbatim and count
@@ -749,7 +811,7 @@ def transcribe_windows(
         if len(failures) > 3:
             warnings.append(f"...and {len(failures) - 3} more cue windows failed")
 
-    return [cue for cue in results if cue is not None], warnings
+    return [cue for cue in results if cue is not None and cue.text.strip()], warnings
 
 
 # ---------------------------------------------------------------------------

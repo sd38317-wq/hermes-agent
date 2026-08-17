@@ -32,6 +32,7 @@ font is a warning in the result rather than a ruined export discovered later.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -402,12 +403,29 @@ def chars_per_line(text: str, font_size: int, video_width: int, *, safe: float =
     return max(6, int(usable / max(1.0, font_size * _em_factor(text))))
 
 
+def _balanced_split(token: str, max_chars: int) -> List[str]:
+    """Split a token with no break points into even pieces.
+
+    Filling each line to the limit leaves the remainder stranded — 19
+    characters at a 9-character limit becomes 9/9/1, and that orphan reads as
+    a mistake on screen. Spreading the same characters over the same number of
+    lines gives 7/6/6. This is the normal case for Korean recognizers that
+    return text with no spacing at all.
+    """
+    pieces = int(math.ceil(len(token) / max_chars))
+    if pieces <= 1:
+        return [token]
+    size = int(math.ceil(len(token) / pieces))
+    return [token[index : index + size] for index in range(0, len(token), size)]
+
+
 def wrap_lines(text: str, max_chars: int) -> List[str]:
     """Break *text* into lines of at most *max_chars*, preferring word breaks.
 
-    Korean is written with spaces between 어절, so word wrapping works; a token
-    longer than the line (a URL, a long compound) is hard-split rather than
-    allowed to overflow the frame.
+    Korean is normally written with spaces between 어절, so word wrapping
+    works; a token longer than the line — a URL, a long compound, or a whole
+    utterance from a recognizer that emits no spaces — is split evenly rather
+    than allowed to overflow the frame.
     """
     text = " ".join((text or "").split())
     if not text:
@@ -417,12 +435,13 @@ def wrap_lines(text: str, max_chars: int) -> List[str]:
     lines: List[str] = []
     current = ""
     for word in text.split(" "):
-        while len(word) > max_chars:
+        if len(word) > max_chars:
             if current:
                 lines.append(current)
                 current = ""
-            lines.append(word[:max_chars])
-            word = word[max_chars:]
+            pieces = _balanced_split(word, max_chars)
+            lines.extend(pieces[:-1])
+            word = pieces[-1]
         if not current:
             current = word
         elif len(current) + 1 + len(word) <= max_chars:

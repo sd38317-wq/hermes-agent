@@ -74,6 +74,15 @@ def test_wrap_breaks_on_spaces_within_the_limit():
     assert " ".join(lines) == "one two three four five"
 
 
+def test_a_token_longer_than_the_line_is_split_evenly_not_greedily():
+    """Korean recognizers often return no spaces at all — greedy filling would
+    leave a one-character orphan on the last line."""
+    lines = wrap_lines("잃을게없는여자들이세상을뒤집으로간다", 9)
+    assert all(len(line) <= 9 for line in lines)
+    assert max(len(line) for line in lines) - min(len(line) for line in lines) <= 1
+    assert "".join(lines) == "잃을게없는여자들이세상을뒤집으로간다"
+
+
 def test_wrap_hard_splits_a_token_longer_than_the_line():
     lines = wrap_lines("https://example.com/an/extremely/long/path", 10)
     assert all(len(line) <= 10 for line in lines)
