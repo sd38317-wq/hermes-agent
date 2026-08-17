@@ -24,6 +24,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tools.registry import registry, tool_error
+from tools.video_captions import (
+    DEFAULT_FONT_SCALE,
+    MAX_FONT_SCALE,
+    MIN_FONT_SCALE,
+    POSITIONS,
+    PRESETS,
+)
 from tools.video_pipeline import (
     ALL_STAGES,
     DEFAULT_CUE_SECONDS,
@@ -32,6 +39,7 @@ from tools.video_pipeline import (
     MAX_CUE_SECONDS,
     MAX_THUMBNAIL_COUNT,
     MAX_TITLE_COUNT,
+    DEFAULT_STAGES,
     MIN_CUE_SECONDS,
     VideoPipelineError,
     find_ffmpeg,
@@ -58,6 +66,12 @@ VIDEO_PIPELINE_SCHEMA: Dict[str, Any] = {
         "paths plus a transcript preview — read the files when you need the full "
         "text.\n"
         "\n"
+        "The `burn` stage renders styled captions into the picture (hard subs) "
+        "and writes an editable .ass alongside — that is what short-form "
+        "platforms need, since a sidecar .srt displays nowhere on Shorts, "
+        "Reels or TikTok. It re-encodes the video, so it is opt-in: pass it in "
+        "`stages` and style it with `caption_style`.\n"
+        "\n"
         "Use `stages` to run only part of the work (e.g. thumbnails only for a "
         "video you already have subtitles for). Subtitles are transcribed one "
         "cue window at a time, so a long video means many STT requests — raise "
@@ -77,10 +91,10 @@ VIDEO_PIPELINE_SCHEMA: Dict[str, Any] = {
                 "type": "array",
                 "items": {"type": "string", "enum": list(ALL_STAGES)},
                 "description": (
-                    "Which stages to run. Defaults to all of them. "
-                    "`titles` implies transcription, so it works even when "
-                    "`subtitles` is not requested (it just writes no subtitle "
-                    "files)."
+                    "Which stages to run. Defaults to everything except "
+                    "`burn` (which re-encodes the video). `titles` and `burn` "
+                    "both imply transcription, so either works without asking "
+                    "for `subtitles`."
                 ),
             },
             "output_dir": {
@@ -127,6 +141,82 @@ VIDEO_PIPELINE_SCHEMA: Dict[str, Any] = {
                     "the video so they are not all from one shot."
                 ),
             },
+            "caption_style": {
+                "type": "object",
+                "description": (
+                    "How burned-in captions look (only used by the `burn` "
+                    "stage). Sizes are fractions of the video height, so one "
+                    "style renders the same on a vertical Short and a "
+                    "landscape export."
+                ),
+                "properties": {
+                    "preset": {
+                        "type": "string",
+                        "enum": sorted(PRESETS),
+                        "description": (
+                            "Starting look, overridden by any field below. "
+                            "`shorts` = big bold white with a heavy outline; "
+                            "`yellow` = the same in yellow; `minimal` = small "
+                            "and low; `boxed` = on a translucent plate."
+                        ),
+                    },
+                    "font": {
+                        "type": "string",
+                        "description": (
+                            "Font family name (e.g. 'Pretendard', 'Noto Sans KR') "
+                            "or a path to a .ttf/.otf file. Defaults to the best "
+                            "installed font that can draw the transcript's "
+                            "script — Korean text needs a Korean font or it "
+                            "renders as boxes."
+                        ),
+                    },
+                    "font_scale": {
+                        "type": "number",
+                        "description": (
+                            f"Caption height as a fraction of the video height "
+                            f"({MIN_FONT_SCALE}-{MAX_FONT_SCALE}, default "
+                            f"{DEFAULT_FONT_SCALE}). 0.05 is typical for "
+                            "short-form."
+                        ),
+                    },
+                    "font_size": {
+                        "type": "integer",
+                        "description": "Absolute size in pixels; overrides font_scale.",
+                    },
+                    "primary_color": {
+                        "type": "string",
+                        "description": "Text colour as #RRGGBB (default #FFFFFF).",
+                    },
+                    "outline_color": {
+                        "type": "string",
+                        "description": "Outline colour as #RRGGBB (default #000000).",
+                    },
+                    "position": {
+                        "type": "string",
+                        "enum": list(POSITIONS),
+                        "description": "Vertical placement (default bottom).",
+                    },
+                    "margin_scale": {
+                        "type": "number",
+                        "description": (
+                            "Distance from that edge as a fraction of height "
+                            "(default 0.16 — clears the platform's own UI)."
+                        ),
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum lines per cue, 1-4 (default 2).",
+                    },
+                    "box": {
+                        "type": "boolean",
+                        "description": "Draw a translucent plate behind the text.",
+                    },
+                    "uppercase": {
+                        "type": "boolean",
+                        "description": "Upper-case the text (Latin scripts only).",
+                    },
+                },
+            },
         },
         "required": ["video_path"],
     },
@@ -154,7 +244,7 @@ def _resolve_video_path(raw: str) -> Path:
 def _coerce_stages(raw: Any) -> Optional[List[str]]:
     """Normalize the ``stages`` argument, or None when it names nothing valid."""
     if raw is None:
-        return list(ALL_STAGES)
+        return list(DEFAULT_STAGES)
     if isinstance(raw, str):
         raw = [part.strip() for part in raw.split(",")]
     if not isinstance(raw, (list, tuple)):
@@ -189,6 +279,7 @@ def video_pipeline(
     title_count: Any = None,
     title_language: Optional[str] = None,
     thumbnail_count: Any = None,
+    caption_style: Any = None,
 ) -> str:
     """Run the video pipeline and return its JSON result."""
     if not isinstance(video_path, str) or not video_path.strip():
@@ -237,6 +328,7 @@ def video_pipeline(
             thumbnail_count=_coerce_int(
                 thumbnail_count, DEFAULT_THUMBNAIL_COUNT, 1, MAX_THUMBNAIL_COUNT
             ),
+            caption_style=caption_style if isinstance(caption_style, dict) else None,
         )
     except VideoPipelineError as exc:
         return tool_error(str(exc))
@@ -265,6 +357,7 @@ def _handle_video_pipeline(args: Dict[str, Any], **_kwargs: Any) -> str:
         title_count=args.get("title_count"),
         title_language=args.get("title_language"),
         thumbnail_count=args.get("thumbnail_count"),
+        caption_style=args.get("caption_style"),
     )
 
 

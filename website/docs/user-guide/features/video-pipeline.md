@@ -15,8 +15,11 @@ The `video_pipeline` tool takes one local video file and produces the assets you
 | `subtitles` | `subtitles.srt` + `subtitles.vtt` with real cue timings, plus `transcript.txt` |
 | `titles` | Hook-style title candidates drafted from the transcript |
 | `thumbnails` | JPEG stills picked by image quality, spread across the video |
+| `burn` | Styled `subtitles.ass` + a `_captioned.mp4` with the captions rendered into the picture |
 
 Everything except the transcription request and the title request runs locally through ffmpeg.
+
+`burn` is the one stage that is **not** in the default set — it re-encodes the video, so you ask for it explicitly.
 
 ## Setup
 
@@ -46,6 +49,42 @@ The agent calls the tool and gets back the output directory, file paths, the tit
 | `title_count` | `5` | 1–12 |
 | `title_language` | transcript language | e.g. `"Korean"` |
 | `thumbnail_count` | `3` | 1–10 |
+| `caption_style` | `{"preset": "shorts"}` | Burned-in caption look — see below |
+
+## Burned-in captions
+
+A sidecar `.srt` displays nowhere on Shorts, Reels or TikTok, so short-form needs the text rendered into the frames. Ask for the `burn` stage:
+
+```
+이 영상 자막 구워서 내보내줘 — 노란색으로, 조금 크게
+```
+
+You get two files: `subtitles.ass` (the styling in an editable format Premiere and Resolve both read) and `<name>_captioned.mp4` (H.264, `+faststart`, audio stream-copied — only the video is re-encoded).
+
+### Style
+
+| Key | Default | Notes |
+|---|---|---|
+| `preset` | `shorts` | `shorts` (big bold white, heavy outline), `yellow`, `minimal`, `boxed` |
+| `font` | best installed | Family name or a path to a `.ttf`/`.otf` |
+| `font_scale` | `0.052` | Fraction of video **height**, not pixels |
+| `font_size` | — | Absolute pixels; overrides `font_scale` |
+| `primary_color` / `outline_color` | `#FFFFFF` / `#000000` | |
+| `position` | `bottom` | `bottom`, `center`, `top` |
+| `margin_scale` | `0.16` | Distance from that edge, as a fraction of height |
+| `max_lines` | `2` | Longer cues split into consecutive blocks, not overflowing lines |
+| `box` / `uppercase` | `false` | Translucent plate behind the text / upper-case (Latin) |
+
+Sizes are fractions of the height so one style renders the same on a 720x1280 phone export and a 1080x1920 master. A cue whose text does not fit in `max_lines` is split into consecutive on-screen blocks with the time divided between them — folding the overflow into the last line would push text off the side of the frame.
+
+### Fonts
+
+**Korean captions need a Korean font.** libass silently substitutes when a family is missing, and the usual result is a wall of tofu boxes discovered after the export. The pipeline checks what is installed before rendering, prefers a Hangul-capable face when the transcript contains Hangul (Pretendard → Noto Sans KR → Noto Sans CJK KR → NanumGothic → the macOS/Windows system faces), and reports what it picked in `captions.font`. A missing requested font is a warning in the result, not a surprise later.
+
+```bash
+# Linux, if nothing Korean is installed
+apt install fonts-noto-cjk
+```
 
 ## How subtitle timing works
 

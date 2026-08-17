@@ -21,6 +21,7 @@ import pytest
 
 from tools.video_pipeline import (
     ALL_STAGES,
+    DEFAULT_STAGES,
     adaptive_noise_floor,
     SCORE_FRAME_SIZE,
     Cue,
@@ -564,7 +565,7 @@ def test_pipeline_end_to_end_writes_every_asset(tmp_path):
     )
     payload = result.as_dict()
 
-    assert set(result.stages) == set(ALL_STAGES)
+    assert set(result.stages) == set(DEFAULT_STAGES)
     assert Path(result.audio_path).exists()
     assert Path(payload["subtitles"]["srt"]).read_text(encoding="utf-8").startswith("1\n")
     assert Path(payload["subtitles"]["vtt"]).read_text(encoding="utf-8").startswith("WEBVTT")

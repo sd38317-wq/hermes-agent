@@ -13,7 +13,12 @@ import pytest
 
 import tools.video_pipeline_tool as vpt
 from tools.registry import registry
-from tools.video_pipeline import ALL_STAGES, PipelineResult, VideoPipelineError
+from tools.video_pipeline import (
+    ALL_STAGES,
+    DEFAULT_STAGES,
+    PipelineResult,
+    VideoPipelineError,
+)
 from toolsets import TOOLSETS
 
 
@@ -109,7 +114,7 @@ def _capture(monkeypatch):
 def test_defaults_are_applied_when_arguments_are_omitted(video_file, monkeypatch):
     captured = _capture(monkeypatch)
     vpt.video_pipeline(str(video_file))
-    assert captured["stages"] == list(ALL_STAGES)
+    assert captured["stages"] == list(DEFAULT_STAGES)
     assert captured["subtitle_formats"] == ["srt", "vtt"]
     assert captured["title_count"] == vpt.DEFAULT_TITLE_COUNT
     assert captured["thumbnail_count"] == vpt.DEFAULT_THUMBNAIL_COUNT
@@ -139,6 +144,25 @@ def test_comma_separated_strings_are_accepted_for_list_arguments(video_file, mon
     vpt.video_pipeline(str(video_file), stages="titles, thumbnails", subtitle_formats="vtt")
     assert captured["stages"] == ["titles", "thumbnails"]
     assert captured["subtitle_formats"] == ["vtt"]
+
+
+def test_burn_is_opt_in_because_it_re_encodes_the_video(video_file, monkeypatch):
+    """A default run must not spend an H.264 pass nobody asked for."""
+    captured = _capture(monkeypatch)
+    vpt.video_pipeline(str(video_file))
+    assert "burn" not in captured["stages"]
+
+    vpt.video_pipeline(str(video_file), stages=["burn"])
+    assert captured["stages"] == ["burn"]
+
+
+def test_caption_style_is_forwarded_only_as_a_mapping(video_file, monkeypatch):
+    captured = _capture(monkeypatch)
+    vpt.video_pipeline(str(video_file), caption_style={"preset": "yellow", "font_scale": 0.06})
+    assert captured["caption_style"] == {"preset": "yellow", "font_scale": 0.06}
+
+    vpt.video_pipeline(str(video_file), caption_style="yellow please")
+    assert captured["caption_style"] is None
 
 
 def test_stage_order_is_normalised_to_pipeline_order(video_file, monkeypatch):

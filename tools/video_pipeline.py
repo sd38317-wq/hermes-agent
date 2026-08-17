@@ -68,7 +68,11 @@ STAGE_AUDIO = "audio"
 STAGE_SUBTITLES = "subtitles"
 STAGE_TITLES = "titles"
 STAGE_THUMBNAILS = "thumbnails"
-ALL_STAGES = (STAGE_AUDIO, STAGE_SUBTITLES, STAGE_TITLES, STAGE_THUMBNAILS)
+STAGE_BURN = "burn"
+ALL_STAGES = (STAGE_AUDIO, STAGE_SUBTITLES, STAGE_TITLES, STAGE_THUMBNAILS, STAGE_BURN)
+# Burn re-encodes the video, so it is not part of the default set — a caller
+# that just wants subtitle files should not pay an H.264 pass for them.
+DEFAULT_STAGES = (STAGE_AUDIO, STAGE_SUBTITLES, STAGE_TITLES, STAGE_THUMBNAILS)
 
 # Audio handed to STT: 16 kHz mono is what whisper-family models resample to
 # anyway, so anything richer is bytes we upload and pay for twice.
@@ -193,6 +197,7 @@ class PipelineResult:
     transcript_chars: int = 0
     transcript_preview: str = ""
     subtitles: Dict[str, Any] = field(default_factory=dict)
+    captions: Dict[str, Any] = field(default_factory=dict)
     titles: List[str] = field(default_factory=list)
     thumbnails: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -214,6 +219,8 @@ class PipelineResult:
             }
         if self.subtitles:
             payload["subtitles"] = self.subtitles
+        if self.captions:
+            payload["captions"] = self.captions
         if self.titles:
             payload["titles"] = self.titles
         if self.thumbnails:
@@ -1210,6 +1217,77 @@ def extract_thumbnails(
 
 
 # ---------------------------------------------------------------------------
+# Stage 5 — burned-in captions
+# ---------------------------------------------------------------------------
+
+
+def write_caption_files(
+    cues: Sequence[Cue],
+    output_dir: str,
+    *,
+    width: int,
+    height: int,
+    style_options: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Write a styled ``subtitles.ass`` for *cues*. Returns ``(info, warnings)``.
+
+    The ASS file is the styling contract: it is what gets burned in, and it is
+    what an editor opens to reproduce or tweak the look by hand.
+    """
+    from tools.video_captions import format_ass, resolve_font, style_from_options
+
+    style, warnings = style_from_options(style_options)
+    font = resolve_font(style.font, " ".join(cue.text for cue in cues))
+    warnings.extend(font.warnings)
+
+    ass_path = Path(output_dir) / "subtitles.ass"
+    ass_path.parent.mkdir(parents=True, exist_ok=True)
+    ass_path.write_text(
+        format_ass(cues, style, width=width, height=height, font=font),
+        encoding="utf-8",
+    )
+
+    info: Dict[str, Any] = {
+        "ass": str(ass_path),
+        "font": font.family,
+        "font_size": style.font_size or max(12, int(round(height * style.font_scale))),
+        "position": style.position,
+        "primary_color": style.primary_color,
+    }
+    return info, warnings
+
+
+def burn_captions(
+    video_path: str,
+    ass_path: str,
+    output_path: str,
+    *,
+    duration: float,
+    fonts_dir: Optional[str] = None,
+    ffmpeg: Optional[str] = None,
+) -> str:
+    """Render *ass_path* into the picture, writing an H.264 MP4 at *output_path*.
+
+    Audio is stream-copied — only the video is touched — and the result is
+    ``+faststart`` so it uploads and previews without a remux.
+    """
+    from tools.video_captions import build_burn_command
+
+    ffmpeg = ffmpeg or find_ffmpeg()
+    if not ffmpeg:
+        raise VideoPipelineError("ffmpeg not found — install ffmpeg to burn captions")
+
+    command = build_burn_command(
+        ffmpeg, video_path, ass_path, output_path, fonts_dir=fonts_dir
+    )
+    # Re-encoding is the slowest thing the pipeline does; give it real headroom.
+    proc = _run(command, timeout=min(MAX_FFMPEG_TIMEOUT, max(600.0, duration * 8)))
+    if proc.returncode != 0 or not Path(output_path).exists():
+        raise VideoPipelineError(f"caption burn-in failed: {_stderr_tail(proc)}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
 # Output location
 # ---------------------------------------------------------------------------
 
@@ -1242,12 +1320,13 @@ def _unique_dir(base: Path) -> Path:
 def run_pipeline(
     video_path: str,
     *,
-    stages: Sequence[str] = ALL_STAGES,
+    stages: Sequence[str] = DEFAULT_STAGES,
     output_dir: Optional[str] = None,
     cue_seconds: float = DEFAULT_CUE_SECONDS,
     stt_model: Optional[str] = None,
     stt_concurrency: Optional[int] = None,
     subtitle_formats: Sequence[str] = ("srt", "vtt"),
+    caption_style: Optional[Dict[str, Any]] = None,
     title_count: int = DEFAULT_TITLE_COUNT,
     title_language: Optional[str] = None,
     thumbnail_count: int = DEFAULT_THUMBNAIL_COUNT,
@@ -1260,7 +1339,9 @@ def run_pipeline(
     Stage dependencies are resolved here rather than pushed onto the caller:
     ``titles`` needs a transcript, and a transcript needs audio, so asking for
     titles alone still runs the audio and transcription work — it just does not
-    write subtitle files unless ``subtitles`` was also requested.
+    write subtitle files unless ``subtitles`` was also requested. ``burn``
+    likewise implies transcription, and writes a styled ``.ass`` on the way to
+    rendering it into the picture.
     """
     requested = {stage for stage in stages if stage in ALL_STAGES}
     if not requested:
@@ -1286,7 +1367,7 @@ def run_pipeline(
 
     result = PipelineResult(output_dir=str(target_dir), video=info)
 
-    needs_transcript = bool(requested & {STAGE_SUBTITLES, STAGE_TITLES})
+    needs_transcript = bool(requested & {STAGE_SUBTITLES, STAGE_TITLES, STAGE_BURN})
     needs_audio = needs_transcript or STAGE_AUDIO in requested
 
     # ── audio ────────────────────────────────────────────────────────────
@@ -1353,6 +1434,39 @@ def run_pipeline(
                 written["cue_count"] = len(cues)
                 result.subtitles = written
                 result.stages.append(STAGE_SUBTITLES)
+
+    # ── styled captions + burn-in ────────────────────────────────────────
+    if STAGE_BURN in requested and cues:
+        caption_info, caption_warnings = write_caption_files(
+            cues,
+            str(target_dir),
+            width=int(info.get("width") or 1080),
+            height=int(info.get("height") or 1920),
+            style_options=caption_style,
+        )
+        result.warnings.extend(caption_warnings)
+        if info.get("has_video"):
+            burned_path = str(target_dir / f"{source.stem or 'video'}_captioned.mp4")
+            try:
+                burn_captions(
+                    str(source),
+                    caption_info["ass"],
+                    burned_path,
+                    duration=duration,
+                    ffmpeg=ffmpeg,
+                )
+            except VideoPipelineError as exc:
+                # The .ass still stands on its own — an editor can render it —
+                # so a failed re-encode is a warning, not a lost stage.
+                result.warnings.append(str(exc))
+            else:
+                caption_info["video"] = burned_path
+                result.stages.append(STAGE_BURN)
+        else:
+            result.warnings.append("the file has no video track — wrote captions but did not burn them")
+        result.captions = caption_info
+    elif STAGE_BURN in requested:
+        result.warnings.append("skipped burn-in — no cues to render")
 
     # ── titles ───────────────────────────────────────────────────────────
     if STAGE_TITLES in requested:
