@@ -1308,6 +1308,16 @@ auxiliary:
     timeout: 30
     # max_concurrency: 2       # Optional: cap simultaneous title-generation calls
 
+  # Video title candidates drafted from a transcript by the
+  # `video_pipeline` tool — see [Video Pipeline](features/video-pipeline.md).
+  # One short call per run; a cheap fast model is plenty.
+  video_titles:
+    provider: "auto"
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 60
+
   # Kanban triage specifier — `hermes kanban specify <id>` (or the
   # dashboard's ✨ Specify button on Triage-column cards) uses this
   # slot to expand a one-liner into a concrete spec and promote the

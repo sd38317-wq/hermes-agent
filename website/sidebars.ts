@@ -118,6 +118,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/computer-use',
             'user-guide/features/vision',
             'user-guide/features/image-generation',
+            'user-guide/features/video-pipeline',
             'user-guide/features/spotify',
             'user-guide/features/pets',
             'user-guide/features/tts',

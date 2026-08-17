@@ -143,6 +143,17 @@ TOOLSETS = {
         "includes": []
     },
     
+    "video_pipeline": {
+        "description": (
+            "Local video post-production: extract audio, transcribe timed "
+            "subtitles (.srt/.vtt), draft title candidates, and pick ranked "
+            "thumbnail frames. Needs ffmpeg installed; opt-in, not in the "
+            "default toolset."
+        ),
+        "tools": ["video_pipeline"],
+        "includes": []
+    },
+
     "image_gen": {
         "description": "Creative generation tools (images)",
         "tools": ["image_generate"],
